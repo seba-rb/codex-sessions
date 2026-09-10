@@ -39,12 +39,63 @@ cx-sessions ls -g "webhook"     # search title, preview and cwd
 cx-sessions rm 019d412b         # by UUID prefix, asks to confirm
 cx-sessions prune --older-than 90 --apply
 cx-sessions prune --orphans --apply
+
+cx-sessions rename 019d412b "Fix the webhook retries"
+cx-sessions rename --auto            # shows what it would name
+cx-sessions rename --auto --apply
 ```
+
+Codex names new sessions on its own, but older ones show a truncated first
+message instead. `rename --auto` fills those in by reading the first things you
+actually typed and asking a model for a short title. It needs an
+OpenAI-compatible endpoint, configured through the environment — nothing is
+hardcoded:
+
+```bash
+export CX_SESSIONS_NAMER_URL=https://your-endpoint/v1
+export CX_SESSIONS_NAMER_TOKEN=...
+export CX_SESSIONS_NAMER_MODEL=...
+```
+
+Without those it explains the setup and changes nothing. Names are written
+straight to the `threads` table because the app-server has no rename method
+(`thread/setName` and `thread/name` don't exist), and the database is backed up
+first.
 
 It reads `CODEX_HOME` from the environment, so it follows whichever account you
 have active. `--all-profiles` merges sessions from every directory matching
 `~/.codex-profiles/*` plus `~/.codex`; set `CODEX_SESSIONS_PROFILE_GLOB` to point
 somewhere else.
+
+### Session status
+
+Each session shows a status, and the header sums them up
+(`2 trabajando · 11 listas`):
+
+| Status | Meaning |
+|---|---|
+| `trabajando` | a turn is in flight |
+| `colgada?` | a turn started but nothing has been written for 5 minutes — the process probably died |
+| `lista` | the last turn finished |
+| `cortada` | the turn was aborted |
+| `huerfana` | the row is there but its rollout file is gone |
+
+These come from the rollout file, not from Codex's daemon. The daemon is the
+only thing that knows live state, but its control socket does not speak the
+app-server protocol — it answers empty to `thread/list` and to made-up methods
+alike. Rollout files, on the other hand, are durable: `task_started` with no
+matching `task_complete` means a turn is running.
+
+### Opening a session doesn't tie it to this window
+
+Inside tmux, `Enter` opens Codex in a **new tmux window**, so going back is
+`Ctrl-b p` and the agent keeps working. That matters: if Codex ran in the
+foreground, the viewer's process would *be* the session and quitting with
+`Ctrl+D` would kill the work in progress.
+
+Outside tmux it creates a detached session and attaches to it, so `Ctrl-b d`
+returns here. Without tmux installed it falls back to running in the
+foreground, and says so — there, quitting Codex does end the session.
 
 ### Keys in the interactive view
 

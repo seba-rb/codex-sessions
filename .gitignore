@@ -2,3 +2,5 @@
 *.bak.*
 .DS_Store
 __pycache__/
+*.v[0-9].*
+cx-sessions.v*

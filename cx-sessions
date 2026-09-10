@@ -275,6 +275,23 @@ def cmd_rm(srv, args):
     return 1 if fallos else 0
 
 
+def _base_estado(codex_home):
+    """La base de sesiones del perfil, o None.
+
+    El nombre lleva version (`state_5.sqlite` hoy) y ya cambio cinco veces: si
+    la esperada no esta, se toma la mas nueva que haya.
+    """
+    db = os.path.join(codex_home, "state_5.sqlite")
+    if os.path.exists(db):
+        return db
+    try:
+        candidatos = sorted(f for f in os.listdir(codex_home)
+                            if f.startswith("state_") and f.endswith(".sqlite"))
+    except OSError:
+        return None
+    return os.path.join(codex_home, candidatos[-1]) if candidatos else None
+
+
 def purgar_huerfanas(codex_home, ids, aplicar):
     """El unico caso que toca la base directamente.
 
@@ -283,13 +300,10 @@ def purgar_huerfanas(codex_home, ids, aplicar):
     API. Es el bug openai/codex#36558: borrar quita el archivo y deja la fila,
     y desde ahi queda trabada para siempre.
     """
-    db = os.path.join(codex_home, "state_5.sqlite")
-    if not os.path.exists(db):
-        candidatos = [f for f in os.listdir(codex_home) if f.startswith("state_") and f.endswith(".sqlite")]
-        if not candidatos:
-            print("  no encontre la base de sesiones; omito las huerfanas", file=sys.stderr)
-            return 0
-        db = os.path.join(codex_home, sorted(candidatos)[-1])
+    db = _base_estado(codex_home)
+    if db is None:
+        print("  no encontre la base de sesiones; omito las huerfanas", file=sys.stderr)
+        return 0
     if not aplicar:
         return len(ids)
     backup = f"{db}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
@@ -347,6 +361,92 @@ def cmd_prune(srv, args):
     return 1 if fallos else 0
 
 
+# Eventos del rollout que marcan el ciclo de vida de una sesion. El resto
+# (item_completed, token_count) es ruido de progreso y se ignora.
+_CICLO = ("task_started", "task_complete", "turn_aborted")
+_ETIQUETA = {"task_started": "trabajando", "task_complete": "lista",
+             "turn_aborted": "cortada"}
+# El ultimo evento se busca leyendo el final del archivo. 64KB alcanzan casi
+# siempre, pero un rollout largo puede tener megabytes de ruido despues del
+# task_started, asi que la ventana crece hasta leerlo entero antes de rendirse.
+_VENTANAS = (65536, 1048576, None)
+_cache_estado = {}
+
+
+def _ultimo_evento(path):
+    for ventana in _VENTANAS:
+        try:
+            with open(path, "rb") as fh:
+                if ventana is None:
+                    fh.seek(0)
+                else:
+                    fh.seek(0, os.SEEK_END)
+                    tam = fh.tell()
+                    if tam <= ventana and ventana != _VENTANAS[0]:
+                        return None  # ya se leyo entero en la pasada anterior
+                    fh.seek(max(0, tam - ventana))
+                    if tam > ventana:
+                        fh.readline()  # descartar la linea partida al medio
+                crudo = fh.read()
+        except OSError:
+            return None
+        visto = None
+        for linea in crudo.split(b"\n"):
+            if b"task_" not in linea and b"turn_aborted" not in linea:
+                continue  # descarte barato antes de parsear
+            try:
+                d = json.loads(linea)
+            except ValueError:
+                continue
+            if d.get("type") != "event_msg":
+                continue
+            tipo = (d.get("payload") or {}).get("type")
+            if tipo in _CICLO:
+                visto = tipo
+        if visto:
+            return visto
+    return None
+
+
+def estado_sesion(sesion):
+    """Etiqueta de estado, derivada del rollout en disco.
+
+    Los estados en vivo solo los conoce el daemon de Codex, y su socket de
+    control no responde el protocolo del app-server (contesta vacio incluso a
+    metodos inventados). El rollout, en cambio, es informacion persistida.
+    """
+    path = sesion.get("path")
+    if not path:
+        return ""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "huerfana"
+    clave = (path, st.st_mtime, st.st_size)
+    if clave in _cache_estado:
+        return _cache_estado[clave]
+    evento = _ultimo_evento(path)
+    etiqueta_ = _ETIQUETA.get(evento, "")
+    # Un task_started sin cierre y sin escrituras recientes es casi siempre un
+    # proceso que murio, no una sesion pensando.
+    if evento == "task_started" and (time.time() - st.st_mtime) > 300:
+        etiqueta_ = "colgada?"
+    _cache_estado[clave] = etiqueta_
+    return etiqueta_
+
+
+def resumen_estados(sesiones):
+    """`3 trabajando · 12 listas`, omitiendo lo que este en cero."""
+    from collections import Counter
+    cuenta = Counter(e for e in (estado_sesion(s) for s in sesiones) if e)
+    orden = ("trabajando", "colgada?", "lista", "cortada", "huerfana")
+    plural = {"lista": "listas", "cortada": "cortadas", "huerfana": "huerfanas",
+              "colgada?": "colgadas?", "trabajando": "trabajando"}
+    partes = [f"{cuenta[e]} {e if cuenta[e] == 1 else plural[e]}"
+              for e in orden if cuenta.get(e)]
+    return " \u00b7 ".join(partes)
+
+
 def archivar(srv, sesion, archivada=True):
     """Archiva o desarchiva una sesion."""
     metodo = "thread/archive" if archivada else "thread/unarchive"
@@ -358,7 +458,9 @@ def archivar(srv, sesion, archivada=True):
 
 
 def _texto_sesion(sesion):
-    return " ".join(str(sesion.get("preview") or sesion.get("name") or "").split())
+    # El nombre gana sobre el preview: si la sesion tiene titulo —puesto por
+    # Codex o por `rename`— es mas util que el primer mensaje truncado.
+    return " ".join(str(sesion.get("name") or sesion.get("preview") or "").split())
 
 
 def _ruta_corta(sesion):
@@ -448,6 +550,9 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
     home = "todos los perfiles" if todos else (
         os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
     titulo = f" CODEX_HOME: {home}  {len(vistas)} sesiones"
+    resumen = resumen_estados(vistas)
+    if resumen:
+        titulo += f"  \u2014 {resumen}"
     if marcadas:
         titulo += f" \u00b7 {len(marcadas)} marcadas"
     stdscr.addnstr(0, 0, titulo, max(1, ancho - 1), curses.A_BOLD)
@@ -480,7 +585,9 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
             aviso = ("  d otra vez para borrar"
                      if elegido and estado.startswith("d otra") else "")
             hueco = max(10, ancho - 1 - len(aviso))
-            texto = f"{'>' if elegido else ' '}{marca} {corto(ses):8} {perfil}{edad:>4}  {_texto_sesion(ses)}"
+            est = estado_sesion(ses)
+            texto = (f"{'>' if elegido else ' '}{marca} {corto(ses):8} {perfil}"
+                     f"{edad:>4}  {est:10} {_texto_sesion(ses)}")
             texto = texto[:hueco]
             if aviso:
                 texto = texto.ljust(hueco) + aviso
@@ -572,16 +679,25 @@ def _ui(stdscr, servidores, todos):
                     # Con varios perfiles no hay uno "actual": se usa el primero,
                     # que es el que la cabecera lista por defecto.
                     entorno["CODEX_HOME"] = next(iter(servidores.values())).home
+                nombre = "codex-nuevo"
             else:
-                destino = None
+                destino = actual.get("cwd") or None
                 cmd = [codex_bin(), "resume", actual["id"]]
                 entorno = dict(os.environ, CODEX_HOME=actual["_codex_home"])
-            stdscr.clear(); curses.endwin()
-            try:
-                subprocess.call(cmd, cwd=destino, env=entorno)
-            finally:
-                stdscr.refresh()
-            sesiones = cargar(); marcadas.clear()
+                nombre = f"codex:{corto(actual)}"
+            if os.environ.get("TMUX"):
+                # La vista no se toca: Codex abre en otra ventana de tmux.
+                _, aviso = lanzar_codex(cmd, destino, entorno, nombre)
+                estado = aviso
+                sesiones = cargar(); marcadas.clear()
+            else:
+                stdscr.clear(); curses.endwin()
+                try:
+                    _, aviso = lanzar_codex(cmd, destino, entorno, nombre)
+                finally:
+                    stdscr.refresh()
+                estado = aviso
+                sesiones = cargar(); marcadas.clear()
         elif tecla == ord("p"):
             if actual is None:
                 estado = "no hay preview de un directorio"
@@ -633,6 +749,240 @@ def _ui(stdscr, servidores, todos):
                 estado = f"d otra vez para borrar {len(elegidas)} sesiones" if len(elegidas) > 1 else "d otra vez para borrar"
 
 
+# Boilerplate que Codex inyecta alrededor del texto del usuario. Un titulo
+# generado a partir de esto no dice nada, asi que esos mensajes se descartan.
+_RELLENO = ("# AGENTS.md instructions", "<environment_context>",
+            "<permissions instructions>", ">>> TRANSCRIPT START",
+            "The following is the Codex agent history")
+
+
+def texto_del_usuario(path, limite=3):
+    """Los primeros mensajes que escribio la persona, sin el relleno.
+
+    Ojo: NO estan en los event_msg de tipo user_message —ahi solo hay prompts
+    que inyecta el sistema— sino en los response_item con role "user".
+    """
+    fuera = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for linea in fh:
+                if '"user"' not in linea:
+                    continue
+                try:
+                    d = json.loads(linea)
+                except ValueError:
+                    continue
+                if d.get("type") != "response_item":
+                    continue
+                pay = d.get("payload") or {}
+                if pay.get("type") != "message" or pay.get("role") != "user":
+                    continue
+                partes = []
+                for c in pay.get("content") or []:
+                    t = c.get("text") if isinstance(c, dict) else None
+                    if t:
+                        partes.append(t)
+                txt = " ".join(partes).strip()
+                if not txt or any(r in txt[:200] for r in _RELLENO):
+                    continue
+                fuera.append(" ".join(txt.split())[:600])
+                if len(fuera) >= limite:
+                    break
+    except OSError:
+        return []
+    return fuera
+
+
+def pedir_titulo(texto):
+    """Un titulo corto, via endpoint compatible con la API de OpenAI.
+
+    Se configura por entorno para no atar la herramienta a ningun proveedor:
+    CX_SESSIONS_NAMER_URL, CX_SESSIONS_NAMER_TOKEN, CX_SESSIONS_NAMER_MODEL.
+    """
+    import urllib.request
+    url = os.environ.get("CX_SESSIONS_NAMER_URL")
+    token = os.environ.get("CX_SESSIONS_NAMER_TOKEN")
+    modelo = os.environ.get("CX_SESSIONS_NAMER_MODEL")
+    cuerpo = json.dumps({
+        "model": modelo,
+        "messages": [
+            {"role": "system", "content":
+             "Resumi la tarea en un titulo de 3 a 6 palabras. Sin comillas, "
+             "sin punto final, en el idioma del texto. Responde solo el titulo."},
+            {"role": "user", "content": texto[:2000]},
+        ],
+        # Holgado a proposito: un modelo de razonamiento gasta tokens pensando
+        # antes de responder, y con un limite chico devuelve content vacio.
+        "max_tokens": 300,
+    }).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/chat/completions", data=cuerpo,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        d = json.loads(r.read())
+    try:
+        msg = d["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"respuesta inesperada: {str(d)[:120]}")
+    # Solo `content`. `reasoning_content` NO sirve como titulo: es el monologo
+    # del modelo ("We need to summarize the user's text into a title...") y
+    # usarlo llena la base de basura. Algunos gateways devuelven una lista de
+    # bloques en vez de una cadena.
+    t = msg.get("content")
+    if isinstance(t, list):
+        t = " ".join(b.get("text", "") for b in t if isinstance(b, dict))
+    t = (t or "").strip().strip('"').strip()
+    t = t.lstrip("#").strip()  # algunos modelos titulan en markdown
+    if not t:
+        raise RuntimeError("el modelo no devolvio un titulo (content vacio)")
+    t = " ".join(t.split())
+    # Una respuesta larga es razonamiento que se colo, no un titulo.
+    if len(t.split()) > 12:
+        raise RuntimeError(f"la respuesta no parece un titulo: {t[:60]}...")
+    return t[:60]
+
+
+def escribir_nombre(codex_home, thread_id, nombre, respaldar=True):
+    """Escribe la columna `name` de la tabla threads.
+
+    Es el unico camino: el app-server no expone metodo para renombrar
+    (`thread/setName` y `thread/name` no existen, responde unknown variant).
+    """
+    db = _base_estado(codex_home)
+    if db is None:
+        return False, "no encontre la base de sesiones"
+    if respaldar:
+        copia = f"{db}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+        if not os.path.exists(copia):
+            shutil.copy2(db, copia)
+    con = sqlite3.connect(db)
+    try:
+        with con:
+            cur = con.execute("update threads set name = ? where id = ?",
+                              (nombre, thread_id))
+        return (cur.rowcount > 0), ("" if cur.rowcount else "no existe esa sesion")
+    finally:
+        con.close()
+
+
+def cmd_rename(srv_o_servidores, args):
+    servidores = (srv_o_servidores if isinstance(srv_o_servidores, dict)
+                  else {"": srv_o_servidores})
+    sesiones = []
+    for nombre, srv in servidores.items():
+        for s in srv.sesiones() + srv.sesiones(archivadas=True):
+            s["_codex_home"] = srv.home
+            sesiones.append(s)
+
+    if args.id:
+        elegidas, faltan = resolver(sesiones, [args.id])
+        if not elegidas:
+            print(f"No encontre una sesion para '{args.id}'.", file=sys.stderr)
+            return 1
+        ok, err = escribir_nombre(elegidas[0]["_codex_home"], elegidas[0]["id"],
+                                  args.nombre)
+        print(f"  {corto(elegidas[0])} -> {args.nombre}" if ok
+              else f"  fallo: {err}")
+        print("  Cerra y volve a abrir Codex para que recargue el listado.")
+        return 0 if ok else 1
+
+    faltantes = [s for s in sesiones if not (s.get("name") or "").strip()]
+    print(f"sesiones sin nombre: {len(faltantes)} de {len(sesiones)}")
+    if not faltantes:
+        return 0
+
+    if not all(os.environ.get(v) for v in
+               ("CX_SESSIONS_NAMER_URL", "CX_SESSIONS_NAMER_TOKEN",
+                "CX_SESSIONS_NAMER_MODEL")):
+        print("\nPara generar nombres hace falta un endpoint compatible con la "
+              "API de OpenAI.\nConfiguralo con:")
+        print("  export CX_SESSIONS_NAMER_URL=https://tu-endpoint/v1")
+        print("  export CX_SESSIONS_NAMER_TOKEN=...")
+        print("  export CX_SESSIONS_NAMER_MODEL=...")
+        print("\nTambien podes renombrar a mano: cx-sessions rename <id> \"Un titulo\"")
+        return 0
+
+    if not args.apply:
+        for s in faltantes[:10]:
+            print(f"  {corto(s)}  {_texto_sesion(s)[:60]}")
+        if len(faltantes) > 10:
+            print(f"  ... y {len(faltantes) - 10} mas")
+        print("\nSolo diagnostico. Agrega --apply para generar los nombres.")
+        return 0
+
+    fallos = 0
+    total = len(faltantes)
+    for i, s in enumerate(faltantes, 1):
+        # flush en cada linea: es una llamada por sesion y sin esto no se ve
+        # ningun avance hasta el final.
+        textos = texto_del_usuario(s.get("path") or "")
+        if not textos:
+            print(f"  [{i}/{total}] {corto(s)}  sin texto util, la salteo", flush=True)
+            continue
+        try:
+            titulo = pedir_titulo("\n".join(textos))
+        except Exception as e:  # una sesion que falla no aborta el lote
+            fallos += 1
+            print(f"  [{i}/{total}] {corto(s)}  fallo al generar: {str(e)[:70]}",
+                  file=sys.stderr, flush=True)
+            continue
+        ok, err = escribir_nombre(s["_codex_home"], s["id"], titulo)
+        print(f"  [{i}/{total}] {corto(s)}  -> {titulo}" if ok
+              else f"  [{i}/{total}] {corto(s)}  {err}", flush=True)
+        fallos += 0 if ok else 1
+    print("\nCerra y volve a abrir Codex para que recargue el listado.")
+    return 1 if fallos else 0
+
+
+def _hay_tmux():
+    return shutil.which("tmux") is not None
+
+
+def lanzar_codex(cmd, cwd, entorno, nombre):
+    """Corre Codex de forma que volver a la vista no termine la sesion.
+
+    En primer plano (subprocess.call) el proceso *es* la sesion: salir con
+    Ctrl+D la mata. Dentro de tmux se abre una ventana aparte, asi que volver
+    es cambiar de ventana y el agente sigue trabajando.
+
+    Devuelve (volvio_solo, aviso): volvio_solo indica si hay que redibujar la
+    vista porque Codex corrio en primer plano y ya termino.
+    """
+    env_flags = []
+    for clave, valor in entorno.items():
+        if clave == "CODEX_HOME":
+            env_flags += ["-e", f"{clave}={valor}"]
+    if not _hay_tmux():
+        # Sin tmux no hay a donde desatacharse: se corre en primer plano, como
+        # antes, y se avisa que salir de Codex termina la sesion.
+        subprocess.call(cmd, cwd=cwd, env=entorno)
+        return True, "sin tmux: al salir de Codex la sesion termina"
+    if os.environ.get("TMUX"):
+        # Ya estamos dentro de tmux: ventana nueva en la misma sesion.
+        tmux_cmd = ["tmux", "new-window", "-n", nombre]
+        if cwd:
+            tmux_cmd += ["-c", cwd]
+        tmux_cmd += env_flags + ["--"] + cmd
+        try:
+            subprocess.run(tmux_cmd, check=True, capture_output=True)
+        except (subprocess.CalledProcessError, OSError) as e:
+            return True, f"no pude abrir la ventana tmux: {e}"
+        return False, "abierta en otra ventana \u2014 Ctrl-b p para volver aca"
+    # Fuera de tmux: sesion propia, attach; al desatachar se vuelve a la vista.
+    sesion = f"codex-{nombre}"
+    crear = ["tmux", "new-session", "-d", "-s", sesion]
+    if cwd:
+        crear += ["-c", cwd]
+    crear += env_flags + ["--"] + cmd
+    try:
+        subprocess.run(crear, check=True, capture_output=True)
+        subprocess.call(["tmux", "attach", "-t", sesion])
+    except (subprocess.CalledProcessError, OSError) as e:
+        return True, f"no pude crear la sesion tmux: {e}"
+    return True, "Ctrl-b d vuelve aca sin cortar el trabajo"
+
+
 def cmd_ui(servidores, todos=False):
     curses.wrapper(lambda stdscr: _ui(stdscr, servidores, todos))
     return 0
@@ -669,6 +1019,14 @@ def main():
                    help="borrar filas cuyo rollout ya no esta en disco")
     p.add_argument("--apply", action="store_true", help="ejecutar (por defecto solo informa)")
     p.add_argument("--yes", "-y", action="store_true", help="sin confirmacion")
+
+    p = sub.add_parser("rename", help="poner nombre a una sesion, o generarlos")
+    p.add_argument("id", nargs="?", help="UUID o prefijo; sin esto, usa --auto")
+    p.add_argument("nombre", nargs="?", help="el nombre nuevo")
+    p.add_argument("--auto", action="store_true",
+                   help="generar nombre para las sesiones que no tienen")
+    p.add_argument("--apply", action="store_true",
+                   help="ejecutar (por defecto solo informa)")
 
     args = ap.parse_args()
     if args.cmd is None:
@@ -713,7 +1071,8 @@ def main():
                 for srv in servidores.values():
                     srv.__exit__(None, None, None)
         with AppServer(home) as srv:
-            return {"ls": cmd_ls, "rm": cmd_rm, "prune": cmd_prune}[args.cmd](srv, args)
+            return {"ls": cmd_ls, "rm": cmd_rm, "prune": cmd_prune,
+                    "rename": cmd_rename}[args.cmd](srv, args)
     except RpcError as e:
         if e.metodo_desconocido:
             print(f"\nEsta version de Codex ya no expone {e.metodo}.\n"
