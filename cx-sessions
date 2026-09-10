@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""Gestion de sesiones de Codex: listar, borrar y purgar.
+
+Codex sabe hacer todo esto —el app-server expone thread/list, thread/delete,
+thread/archive— pero el TUI no lo expone: en la vista de sesiones no hay forma
+de borrar, y `codex delete` va de a una y pidiendo el UUID entero.
+
+Se habla el protocolo del app-server en vez de tocar state_5.sqlite, porque es
+el mismo que usan el TUI y la app Desktop: sobrevive mejor a las
+actualizaciones que un esquema de base que ya va por su quinta version. La
+unica excepcion es la purga de huerfanas, abajo.
+
+  cx-sessions ls [filtros]
+  cx-sessions rm <id|prefijo>... [--yes]
+  cx-sessions prune [--older-than N] [--orphans] [--apply]
+
+El CODEX_HOME del entorno manda; si no hay, ~/.codex.
+"""
+import argparse
+import curses
+import glob
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+
+TIMEOUT = 30
+
+
+def codex_bin():
+    local = os.path.expanduser("~/.local/bin/codex")
+    return local if os.path.exists(local) else "codex"
+
+
+class AppServer:
+    """Cliente JSON-RPC sobre un `codex app-server` de vida corta."""
+
+    def __init__(self, codex_home):
+        self.home = codex_home
+        self.proc = None
+        self._respuestas = {}
+        self._siguiente_id = 100
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        self.proc = subprocess.Popen(
+            [codex_bin(), "app-server"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, CODEX_HOME=self.home), text=True, bufsize=1,
+        )
+        threading.Thread(target=self._leer, daemon=True).start()
+        self.llamar("initialize", {"clientInfo": {
+            "name": "cx-sessions", "title": "cx-sessions", "version": "1"}})
+        return self
+
+    def __exit__(self, *_):
+        if self.proc:
+            self.proc.kill()
+
+    def _leer(self):
+        for linea in self.proc.stdout:
+            try:
+                msg = json.loads(linea)
+            except ValueError:
+                continue
+            if isinstance(msg.get("id"), int):
+                with self._lock:
+                    self._respuestas[msg["id"]] = msg
+
+    def llamar(self, metodo, params=None):
+        with self._lock:
+            self._siguiente_id += 1
+            rid = self._siguiente_id
+        self.proc.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": rid, "method": metodo, "params": params or {}}) + "\n")
+        self.proc.stdin.flush()
+        limite = time.time() + TIMEOUT
+        while time.time() < limite:
+            with self._lock:
+                if rid in self._respuestas:
+                    msg = self._respuestas.pop(rid)
+                    break
+            if self.proc.poll() is not None:
+                raise RuntimeError("el app-server se cerro antes de responder")
+            time.sleep(0.02)
+        else:
+            raise RuntimeError(f"{metodo}: sin respuesta en {TIMEOUT}s")
+        if "error" in msg:
+            raise RpcError(metodo, msg["error"])
+        return msg.get("result", {})
+
+    def sesiones(self, archivadas=False):
+        """Todas las paginas de thread/list, ya aplanadas."""
+        out, cursor = [], None
+        while True:
+            params = {"limit": 100, "archived": archivadas}
+            if cursor:
+                params["cursor"] = cursor
+            r = self.llamar("thread/list", params)
+            out.extend(r.get("data", []))
+            cursor = r.get("nextCursor")
+            if not cursor:
+                return out
+
+
+class RpcError(Exception):
+    def __init__(self, metodo, err):
+        self.metodo, self.code = metodo, err.get("code")
+        self.msg = err.get("message", "")
+        super().__init__(f"{metodo}: [{self.code}] {self.msg}")
+
+    @property
+    def metodo_desconocido(self):
+        return self.code == -32601 or "unknown variant" in self.msg
+
+
+# ── formato ──────────────────────────────────────────────────────────
+
+def edad_dias(sesion):
+    ts = sesion.get("updatedAt") or sesion.get("recencyAt") or sesion.get("createdAt")
+    if not ts:
+        return None
+    try:  # ISO-8601, con o sin Z
+        t = time.mktime(time.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        try:
+            t = float(ts) / (1000 if float(ts) > 1e11 else 1)
+        except (TypeError, ValueError):
+            return None
+    return (time.time() - t) / 86400
+
+
+def etiqueta(sesion):
+    txt = sesion.get("name") or sesion.get("preview") or ""
+    return " ".join(str(txt).split())[:60] or "(sin titulo)"
+
+
+def corto(sesion):
+    return str(sesion.get("id", ""))[:8]
+
+
+def imprimir(sesiones, mostrar_ruta=False):
+    if not sesiones:
+        print("No hay sesiones que coincidan.")
+        return
+    home = os.path.expanduser("~")
+    for s in sesiones:
+        dias = edad_dias(s)
+        edad = f"{dias:4.0f}d" if dias is not None else "   ?"
+        cwd = str(s.get("cwd") or "")
+        if cwd.startswith(home):
+            cwd = "~" + cwd[len(home):]
+        huerfana = " [huerfana]" if s.get("path") and not os.path.isfile(s["path"]) else ""
+        print(f"  {corto(s)}  {edad}  {etiqueta(s):<60}  {cwd}{huerfana}")
+        if mostrar_ruta:
+            print(f"            {s.get('id')}  {s.get('path')}")
+    print(f"\n{len(sesiones)} sesion(es).")
+
+
+def filtrar(sesiones, args):
+    home = os.path.expanduser("~")
+    out = []
+    for s in sesiones:
+        if getattr(args, "cwd", None):
+            objetivo = os.path.abspath(os.path.expanduser(args.cwd))
+            if not str(s.get("cwd") or "").startswith(objetivo):
+                continue
+        if getattr(args, "days", None) is not None:
+            d = edad_dias(s)
+            if d is None or d > args.days:
+                continue
+        if getattr(args, "grep", None):
+            aguja = args.grep.lower()
+            heno = f"{s.get('name') or ''} {s.get('preview') or ''} {s.get('cwd') or ''}".lower()
+            if aguja not in heno:
+                continue
+        if getattr(args, "model", None) and args.model not in str(s.get("model") or ""):
+            continue
+        _ = home
+        out.append(s)
+    return out
+
+
+# ── comandos ─────────────────────────────────────────────────────────
+
+def cmd_ls(srv, args):
+    sesiones = srv.sesiones(archivadas=args.archived)
+    sesiones = filtrar(sesiones, args)
+    sesiones.sort(key=lambda s: edad_dias(s) if edad_dias(s) is not None else 1e9)
+    if args.limit:
+        sesiones = sesiones[:args.limit]
+    if args.json:
+        print(json.dumps(sesiones, indent=2, ensure_ascii=False))
+        return 0
+    imprimir(sesiones, args.verbose)
+    return 0
+
+
+def resolver(sesiones, refs):
+    """Prefijos de UUID -> sesiones. Un prefijo ambiguo es un error, no una apuesta."""
+    elegidas, faltan = [], []
+    for ref in refs:
+        coinciden = [s for s in sesiones if str(s.get("id", "")).startswith(ref)]
+        if not coinciden:
+            faltan.append(ref)
+        elif len(coinciden) > 1:
+            print(f"'{ref}' coincide con {len(coinciden)} sesiones:", file=sys.stderr)
+            for s in coinciden:
+                print(f"    {s['id']}  {etiqueta(s)}", file=sys.stderr)
+            faltan.append(ref)
+        else:
+            elegidas.append(coinciden[0])
+    return elegidas, faltan
+
+
+def explicar_error(msg, codex_home):
+    """Traduce los errores crudos del app-server a algo accionable."""
+    if "active writer" in msg:
+        return ("la sesion esta abierta en otro proceso. Cerrala donde la tengas "
+                "abierta, o reinicia el daemon: pkill -f "
+                f"'{codex_home}/packages/standalone/current/codex app-server'")
+    if "no rollout found" in msg:
+        return ("fila huerfana: el .jsonl ya no esta. Limpiala con "
+                "cx-sessions prune --orphans --apply")
+    return msg
+
+
+def borrar(srv, sesion):
+    """thread/delete, con la CLI publica como red de seguridad."""
+    try:
+        srv.llamar("thread/delete", {"threadId": sesion["id"]})
+        return True, None
+    except RpcError as e:
+        if not e.metodo_desconocido:
+            return False, explicar_error(e.msg, srv.home)
+        r = subprocess.run([codex_bin(), "delete", "--force", sesion["id"]],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, CODEX_HOME=srv.home))
+        if r.returncode == 0:
+            return True, None
+        return False, (r.stderr or r.stdout).strip()[:120]
+
+
+def confirmar(sesiones, verbo="borrar"):
+    print(f"\nSe van a {verbo} {len(sesiones)} sesion(es). No se puede deshacer.")
+    if not sys.stdin.isatty():
+        print("No hay terminal interactiva; usa --yes para confirmar.", file=sys.stderr)
+        return False
+    return input("Continuar? [y/N]: ").strip().lower() in ("y", "yes", "s", "si")
+
+
+def cmd_rm(srv, args):
+    sesiones = srv.sesiones() + srv.sesiones(archivadas=True)
+    elegidas, faltan = resolver(sesiones, args.refs)
+    for ref in faltan:
+        print(f"No encontre una sesion para '{ref}'.", file=sys.stderr)
+    if not elegidas:
+        return 1
+    imprimir(elegidas)
+    if not args.yes and not confirmar(elegidas):
+        print("Cancelado.")
+        return 0
+    fallos = 0
+    for s in elegidas:
+        ok, err = borrar(srv, s)
+        if ok:
+            print(f"  borrada  {corto(s)}  {etiqueta(s)}")
+        else:
+            fallos += 1
+            print(f"  FALLO    {corto(s)}  {err}", file=sys.stderr)
+    return 1 if fallos else 0
+
+
+def purgar_huerfanas(codex_home, ids, aplicar):
+    """El unico caso que toca la base directamente.
+
+    `thread/delete` exige que el rollout exista ("no rollout found for thread
+    id"), asi que una fila cuyo archivo ya no esta no se puede borrar por la
+    API. Es el bug openai/codex#36558: borrar quita el archivo y deja la fila,
+    y desde ahi queda trabada para siempre.
+    """
+    db = os.path.join(codex_home, "state_5.sqlite")
+    if not os.path.exists(db):
+        candidatos = [f for f in os.listdir(codex_home) if f.startswith("state_") and f.endswith(".sqlite")]
+        if not candidatos:
+            print("  no encontre la base de sesiones; omito las huerfanas", file=sys.stderr)
+            return 0
+        db = os.path.join(codex_home, sorted(candidatos)[-1])
+    if not aplicar:
+        return len(ids)
+    backup = f"{db}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(db, backup)
+    print(f"  backup de la base: {backup}")
+    con = sqlite3.connect(db)
+    with con:
+        for tid in ids:
+            con.execute("delete from threads where id = ?", (tid,))
+    con.close()
+    return len(ids)
+
+
+def cmd_prune(srv, args):
+    if args.older_than is None and not args.orphans:
+        print("Decime que purgar: --older-than N y/o --orphans.", file=sys.stderr)
+        return 2
+
+    sesiones = srv.sesiones() + srv.sesiones(archivadas=True)
+    huerfanas = [s for s in sesiones if s.get("path") and not os.path.isfile(s["path"])]
+    viejas = []
+    if args.older_than is not None:
+        for s in sesiones:
+            d = edad_dias(s)
+            if d is not None and d > args.older_than and s not in huerfanas:
+                viejas.append(s)
+
+    if args.orphans and huerfanas:
+        print(f"Huerfanas (fila sin rollout en disco): {len(huerfanas)}")
+        imprimir(huerfanas)
+    if args.older_than is not None:
+        print(f"\nMas viejas que {args.older_than} dias: {len(viejas)}")
+        imprimir(viejas)
+
+    total = len(viejas) + (len(huerfanas) if args.orphans else 0)
+    if not total:
+        print("\nNada que purgar.")
+        return 0
+    if not args.apply:
+        print("\nSolo diagnostico. Agrega --apply para ejecutarlo.")
+        return 0
+    if not args.yes and not confirmar(list(viejas) + (huerfanas if args.orphans else []), "purgar"):
+        print("Cancelado.")
+        return 0
+
+    fallos = 0
+    for s in viejas:
+        ok, err = borrar(srv, s)
+        print(f"  borrada  {corto(s)}  {etiqueta(s)}" if ok else f"  FALLO    {corto(s)}  {err}")
+        fallos += 0 if ok else 1
+    if args.orphans and huerfanas:
+        n = purgar_huerfanas(srv.home, [s["id"] for s in huerfanas], True)
+        print(f"  {n} fila(s) huerfana(s) eliminada(s) de la base")
+        print("  Cerra y volve a abrir Codex para que recargue el listado.")
+    return 1 if fallos else 0
+
+
+def archivar(srv, sesion, archivada=True):
+    """Archiva o desarchiva una sesion."""
+    metodo = "thread/archive" if archivada else "thread/unarchive"
+    try:
+        srv.llamar(metodo, {"threadId": sesion["id"]})
+        return True, None
+    except RpcError as e:
+        return False, e.msg
+
+
+def _texto_sesion(sesion):
+    return " ".join(str(sesion.get("preview") or sesion.get("name") or "").split())
+
+
+def _ruta_corta(sesion):
+    cwd = str(sesion.get("cwd") or "")
+    home = os.path.expanduser("~")
+    return "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+
+
+def _preview_ui(stdscr, srv, sesion):
+    try:
+        # thread/items/list responde "not supported yet" en sesiones viejas
+        # (formato de rollout anterior); thread/read sirve para todas, solo que
+        # trae los items envueltos en turnos.
+        try:
+            entradas = srv.llamar(
+                "thread/items/list", {"threadId": sesion["id"], "limit": 20}).get("data", [])
+        except RpcError:
+            hilo = srv.llamar(
+                "thread/read", {"threadId": sesion["id"], "includeTurns": True}).get("thread", {})
+            entradas = []
+            for turno in hilo.get("turns") or []:
+                entradas.extend(turno.get("items") or [])
+            entradas = entradas[:20]
+        lineas = [etiqueta(sesion), "", f"cwd: {_ruta_corta(sesion)}", ""]
+        for entrada in entradas:
+            item = entrada.get("item") if isinstance(entrada.get("item"), dict) else entrada
+            valor = item.get("text") or item.get("content") or item.get("message") or item.get("summary")
+            if isinstance(valor, list):
+                valor = "\n".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in valor)
+            valor = valor or f"[{item.get('type') or item.get('itemType') or 'item'}]"
+            tipo = item.get("type") or item.get("itemType") or ""
+            lineas.append(f"--- {tipo} ---" if tipo else "---")
+            lineas.extend(str(valor).splitlines() or [""])
+    except Exception as e:
+        lineas = [f"Error al cargar preview: {e}"]
+    alto, ancho = stdscr.getmaxyx()
+    stdscr.erase()
+    for y, linea in enumerate(lineas[:max(1, alto - 2)]):
+        stdscr.addnstr(y, 0, linea, max(1, ancho - 1))
+    stdscr.addnstr(alto - 1, 0, "Cualquier tecla vuelve", max(1, ancho - 1), curses.A_DIM)
+    stdscr.refresh()
+    curses.flushinp()
+    stdscr.getch()
+
+
+def _armar_filas(vistas, cwd_actual):
+    """Filas a dibujar y elementos navegables, en el mismo orden.
+
+    El cursor se mueve sobre `navegables`, que ahora incluye los encabezados de
+    grupo: pararse en uno y pulsar Enter abre una sesion nueva en ese
+    directorio. Antes los encabezados se saltaban; ahora son un destino.
+
+    `cwd_actual` siempre aparece como grupo aunque no tenga ninguna sesion, que
+    es lo que permite arrancar una desde un repo donde todavia no hubo ninguna.
+    """
+    grupos = {}
+    for i, s in enumerate(vistas):
+        grupos.setdefault(_ruta_corta(s), []).append(i)
+    if cwd_actual and cwd_actual not in grupos:
+        grupos[cwd_actual] = []
+
+    def recencia(indices):
+        if not indices:
+            return -1.0  # un grupo vacio es el directorio actual: va primero
+        d = edad_dias(vistas[indices[0]])
+        return d if d is not None else 1e9
+
+    filas, navegables, vacios = [], [], set()
+    for pos, (ruta, indices) in enumerate(
+            sorted(grupos.items(), key=lambda kv: recencia(kv[1]))):
+        if pos:
+            filas.append(("blanco", None))
+        navegables.append(len(filas))
+        filas.append(("grupo", ruta))
+        if not indices:
+            vacios.add(ruta)
+        for i in indices:
+            navegables.append(len(filas))
+            filas.append(("sesion", i))
+    return filas, navegables, vacios
+
+
+def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
+                archivadas, estado, todos, cwd_actual, vacios):
+    alto, ancho = stdscr.getmaxyx()
+    stdscr.erase()
+    home = "todos los perfiles" if todos else (
+        os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+    titulo = f" CODEX_HOME: {home}  {len(vistas)} sesiones"
+    if marcadas:
+        titulo += f" \u00b7 {len(marcadas)} marcadas"
+    stdscr.addnstr(0, 0, titulo, max(1, ancho - 1), curses.A_BOLD)
+    stdscr.addnstr(1, 0, "-" * max(1, ancho - 1), max(1, ancho - 1))
+    cuerpo = max(1, alto - 5)
+    fila_cursor = navegables[cursor] if navegables else 0
+    inicio = max(0, min(fila_cursor - cuerpo + 1, max(0, len(filas) - cuerpo)))
+    y = 2
+    for idx, (tipo, valor) in enumerate(filas[inicio:inicio + cuerpo], inicio):
+        if y >= alto - 3:
+            break
+        elegido = idx == fila_cursor
+        if tipo == "blanco":
+            pass
+        elif tipo == "grupo":
+            sufijo = "  (aqui)" if valor == cwd_actual else ""
+            if valor in vacios:
+                sufijo += "  sin sesiones \u2014 Enter para crear una"
+            stdscr.addnstr(y, 0, f"{'>' if elegido else ' '} {valor}{sufijo}",
+                           max(1, ancho - 1),
+                           curses.A_BOLD | (curses.A_REVERSE if elegido else 0))
+        else:
+            ses = vistas[valor]
+            dias = edad_dias(ses)
+            edad = f"{dias:.0f}d" if dias is not None else "?d"
+            marca = "*" if ses.get("id") in marcadas else " "
+            perfil = (str(ses.get("_perfil", ""))[:9] + " ") if todos else ""
+            # El aviso se reserva ANTES de recortar el titulo: agregarlo despues
+            # hace que el addnstr posterior lo corte y no se vea nunca.
+            aviso = ("  d otra vez para borrar"
+                     if elegido and estado.startswith("d otra") else "")
+            hueco = max(10, ancho - 1 - len(aviso))
+            texto = f"{'>' if elegido else ' '}{marca} {corto(ses):8} {perfil}{edad:>4}  {_texto_sesion(ses)}"
+            texto = texto[:hueco]
+            if aviso:
+                texto = texto.ljust(hueco) + aviso
+            stdscr.addnstr(y, 0, texto, max(1, ancho - 1),
+                           curses.A_REVERSE if elegido else 0)
+        y += 1
+    stdscr.addnstr(alto - 3, 0, "-" * max(1, ancho - 1), max(1, ancho - 1))
+    modo = "archivadas" if archivadas else "activas"
+    stdscr.addnstr(alto - 2, 0, f"filtro ({modo}): {filtro}_", max(1, ancho - 1))
+    en_grupo = bool(navegables) and filas[fila_cursor][0] == "grupo"
+    ayuda = ("Enter sesion nueva aqui \u00b7 j/k mover \u00b7 / filtrar \u00b7 q salir"
+             if en_grupo else
+             "Enter abrir \u00b7 p preview \u00b7 d borrar \u00b7 a archivar \u00b7 / filtrar")
+    stdscr.addnstr(alto - 1, 0, ayuda, max(1, ancho - 1), curses.A_DIM)
+    if estado and not estado.startswith("d otra"):
+        stdscr.addnstr(alto - 4, 0, estado, max(1, ancho - 1), curses.A_BOLD)
+    stdscr.refresh()
+
+
+def _ui(stdscr, servidores, todos):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    archivadas, filtro, marcadas, estado, cursor = False, "", set(), "", 0
+    def cargar():
+        out = []
+        for nombre, srv in servidores.items():
+            try:
+                for s in srv.sesiones(archivadas=archivadas):
+                    s["_perfil"], s["_codex_home"], s["_srv"] = nombre, srv.home, srv
+                    out.append(s)
+            except Exception as e:
+                nonlocal estado
+                estado = f"{nombre}: no se pudo cargar"
+        return out
+    sesiones = cargar()
+    # Directorio desde donde se abrio la vista: aparece como grupo aunque no
+    # tenga sesiones, para poder arrancar una ahi.
+    try:
+        cwd_actual = _ruta_corta({"cwd": os.getcwd()})
+    except OSError:
+        cwd_actual = None
+    while True:
+        vistas = filtrar(sesiones, argparse.Namespace(
+            grep=filtro, cwd=None, days=None, model=None))
+        vistas.sort(key=lambda x: edad_dias(x) if edad_dias(x) is not None else 1e9)
+        filas, navegables, vacios = _armar_filas(vistas, cwd_actual)
+        cursor = min(cursor, max(0, len(navegables) - 1))
+        _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
+                    archivadas, estado, todos, cwd_actual, vacios)
+        tecla = stdscr.getch(); previo = estado; estado = ""
+
+        # Que hay bajo el cursor: un encabezado de directorio, o una sesion.
+        tipo, valor = filas[navegables[cursor]] if navegables else (None, None)
+        actual = vistas[valor] if tipo == "sesion" else None
+
+        if tecla in (ord("q"), ord("Q"), 3): return
+        if tecla == curses.KEY_RESIZE: continue
+        if tecla in (curses.KEY_DOWN, ord("j")):
+            cursor = min(cursor + 1, max(0, len(navegables) - 1))
+        elif tecla in (curses.KEY_UP, ord("k")):
+            cursor = max(0, cursor - 1)
+        elif tecla == curses.KEY_NPAGE:
+            cursor = min(cursor + max(1, stdscr.getmaxyx()[0] - 5),
+                         max(0, len(navegables) - 1))
+        elif tecla == curses.KEY_PPAGE:
+            cursor = max(0, cursor - max(1, stdscr.getmaxyx()[0] - 5))
+        elif tecla == ord("g"): cursor = 0
+        elif tecla == ord("G"): cursor = max(0, len(navegables) - 1)
+        elif tecla == ord(" "):
+            if actual is None:
+                estado = "marcar no aplica a un directorio"
+            else:
+                marcadas.symmetric_difference_update({actual["id"]})
+        elif tecla == ord("r") or tecla == ord("t"):
+            if tecla == ord("t"): archivadas = not archivadas; cursor = 0
+            sesiones = cargar(); marcadas.clear()
+        elif tecla in (10, 13, curses.KEY_ENTER) and navegables:
+            # Sobre un directorio, Enter arranca una sesion nueva ahi; sobre una
+            # sesion, la reanuda. En ambos casos se sale de curses, corre Codex,
+            # y al volver se recarga la lista.
+            if actual is None:
+                destino = os.path.expanduser(valor)
+                if not os.path.isdir(destino):
+                    estado = f"{valor} ya no existe"
+                    continue
+                cmd = [codex_bin()]
+                entorno = dict(os.environ)
+                if todos:
+                    # Con varios perfiles no hay uno "actual": se usa el primero,
+                    # que es el que la cabecera lista por defecto.
+                    entorno["CODEX_HOME"] = next(iter(servidores.values())).home
+            else:
+                destino = None
+                cmd = [codex_bin(), "resume", actual["id"]]
+                entorno = dict(os.environ, CODEX_HOME=actual["_codex_home"])
+            stdscr.clear(); curses.endwin()
+            try:
+                subprocess.call(cmd, cwd=destino, env=entorno)
+            finally:
+                stdscr.refresh()
+            sesiones = cargar(); marcadas.clear()
+        elif tecla == ord("p"):
+            if actual is None:
+                estado = "no hay preview de un directorio"
+            else:
+                _preview_ui(stdscr, actual["_srv"], actual)
+        elif tecla == ord("/"):
+            buffer = filtro
+            while True:
+                previas = filtrar(sesiones, argparse.Namespace(
+                    grep=buffer, cwd=None, days=None, model=None))
+                previas.sort(key=lambda x: edad_dias(x) if edad_dias(x) is not None else 1e9)
+                f2, n2, v2 = _armar_filas(previas, cwd_actual)
+                _dibujar_ui(stdscr, previas, f2, n2, 0, marcadas, buffer,
+                            archivadas, "filtrando \u2014 Enter fija, Esc cancela",
+                            todos, cwd_actual, v2)
+                k = stdscr.getch()
+                if k in (10, 13, curses.KEY_ENTER): filtro = buffer; break
+                if k == 27: break
+                if k in (curses.KEY_BACKSPACE, 127, 8): buffer = buffer[:-1]
+                elif k == curses.KEY_RESIZE: continue
+                elif 32 <= k < 127: buffer += chr(k)
+            cursor = 0
+        elif tecla == 27: filtro = ""
+        elif tecla == ord("a"):
+            elegidas = [s for s in vistas if s["id"] in marcadas]
+            if not elegidas and actual is not None:
+                elegidas = [actual]
+            if not elegidas:
+                estado = "archivar no aplica a un directorio"
+                continue
+            for s in elegidas:
+                ok, err = archivar(s["_srv"], s, not archivadas)
+                if ok: sesiones.remove(s); marcadas.discard(s["id"])
+                else: estado = err or "fallo al archivar"
+        elif tecla == ord("d"):
+            elegidas = [s for s in vistas if s["id"] in marcadas]
+            if not elegidas and actual is not None:
+                elegidas = [actual]
+            if not elegidas:
+                estado = "borrar no aplica a un directorio"
+                continue
+            armado = previo.startswith("d otra")
+            if armado:
+                for s in elegidas:
+                    ok, err = borrar(s["_srv"], s)
+                    if ok: sesiones.remove(s); marcadas.discard(s["id"])
+                    else: estado = err or "fallo al borrar"
+            else:
+                estado = f"d otra vez para borrar {len(elegidas)} sesiones" if len(elegidas) > 1 else "d otra vez para borrar"
+
+
+def cmd_ui(servidores, todos=False):
+    curses.wrapper(lambda stdscr: _ui(stdscr, servidores, todos))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="cx-sessions", description="Listar, borrar y purgar sesiones de Codex.")
+    sub = ap.add_subparsers(dest="cmd")
+    ui_parser = sub.add_parser("ui", help="abrir la vista interactiva")
+    ui_parser.add_argument("--all-profiles", action="store_true", help="usar todos los perfiles")
+    ap.add_argument("--all-profiles", action="store_true", help="usar todos los perfiles")
+
+    def filtros(p):
+        p.add_argument("--cwd", help="solo sesiones bajo este directorio")
+        p.add_argument("--days", type=float, metavar="N", help="solo las de los ultimos N dias")
+        p.add_argument("--grep", "-g", metavar="TEXTO", help="filtra por titulo, preview o cwd")
+        p.add_argument("--model", help="filtra por modelo")
+
+    p = sub.add_parser("ls", help="listar sesiones")
+    filtros(p)
+    p.add_argument("--archived", action="store_true", help="las archivadas en vez de las activas")
+    p.add_argument("--limit", type=int, help="cortar a las N mas recientes")
+    p.add_argument("--verbose", "-v", action="store_true", help="mostrar UUID y ruta completos")
+    p.add_argument("--json", action="store_true", help="salida cruda")
+
+    p = sub.add_parser("rm", help="borrar sesiones por id o prefijo")
+    p.add_argument("refs", nargs="+", metavar="ID", help="UUID completo o prefijo")
+    p.add_argument("--yes", "-y", action="store_true", help="sin confirmacion")
+
+    p = sub.add_parser("prune", help="purgar sesiones viejas y filas huerfanas")
+    p.add_argument("--older-than", type=float, metavar="N", help="borrar las de mas de N dias")
+    p.add_argument("--orphans", action="store_true",
+                   help="borrar filas cuyo rollout ya no esta en disco")
+    p.add_argument("--apply", action="store_true", help="ejecutar (por defecto solo informa)")
+    p.add_argument("--yes", "-y", action="store_true", help="sin confirmacion")
+
+    args = ap.parse_args()
+    if args.cmd is None:
+        args.cmd = "ui"
+    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    todos = getattr(args, "all_profiles", False)
+    homes = {os.path.basename(home.rstrip(os.sep)) or "default": home}
+    if args.cmd == "ui" and todos:
+        # Donde buscar CODEX_HOMEs adicionales. Por defecto ~/.codex-profiles/*,
+        # que es la convencion de quien mantiene varias cuentas; se puede
+        # cambiar con CODEX_SESSIONS_PROFILE_GLOB.
+        patron = os.environ.get("CODEX_SESSIONS_PROFILE_GLOB",
+                                os.path.expanduser("~/.codex-profiles/*"))
+        homes = {os.path.basename(p.rstrip(os.sep)) or "default": p
+                 for p in glob.glob(os.path.expanduser(patron)) if os.path.isdir(p)}
+        homes["default"] = os.path.expanduser("~/.codex")
+    if args.cmd == "ui" and not sys.stdin.isatty():
+        print("Sin TTY; abriendo listado plano.", file=sys.stderr)
+        args.cmd = "ls"
+        args.archived = False
+        args.limit = None
+        args.verbose = False
+        args.json = False
+        args.cwd = args.days = args.grep = args.model = None
+    if not os.path.isdir(home):
+        print(f"CODEX_HOME no existe: {home}", file=sys.stderr)
+        return 1
+    print(f"CODEX_HOME: {home}")
+
+    try:
+        if args.cmd == "ui":
+            servidores = {}
+            for nombre, ruta in homes.items():
+                if os.path.isdir(ruta):
+                    try:
+                        servidores[nombre] = AppServer(ruta).__enter__()
+                    except Exception as e:
+                        print(f"{nombre}: no se pudo abrir", file=sys.stderr)
+            try:
+                return cmd_ui(servidores, todos)
+            finally:
+                for srv in servidores.values():
+                    srv.__exit__(None, None, None)
+        with AppServer(home) as srv:
+            return {"ls": cmd_ls, "rm": cmd_rm, "prune": cmd_prune}[args.cmd](srv, args)
+    except RpcError as e:
+        if e.metodo_desconocido:
+            print(f"\nEsta version de Codex ya no expone {e.metodo}.\n"
+                  "El protocolo del app-server cambio; hay que actualizar cx-sessions.",
+                  file=sys.stderr)
+        else:
+            print(f"\n{e}", file=sys.stderr)
+        return 1
+    except (RuntimeError, KeyboardInterrupt) as e:
+        print(f"\n{e or 'cancelado'}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
