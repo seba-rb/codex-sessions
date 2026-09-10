@@ -52,8 +52,16 @@ def _preview_ui(stdscr, srv, sesion):
         stdscr.addnstr(y, 0, linea, max(1, ancho - 1))
     stdscr.addnstr(alto - 1, 0, "Cualquier tecla vuelve", max(1, ancho - 1), curses.A_DIM)
     stdscr.refresh()
+    # Descartar teclas encoladas: una tipeada un instante antes cerraria el
+    # preview antes de que se alcance a leer.
     curses.flushinp()
-    stdscr.getch()
+    # El bucle principal deja getch con timeout para autorefrescarse; aca hay
+    # que esperar de verdad, si no el preview se cierra solo al segundo y medio.
+    stdscr.timeout(-1)
+    try:
+        stdscr.getch()
+    finally:
+        stdscr.timeout(1500)
 
 
 def _armar_filas(vistas, cwd_actual):
@@ -160,6 +168,27 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
     stdscr.refresh()
 
 
+def _huella_sesiones(homes):
+    """Firma barata de "que sesiones hay", para saber si vale recargar.
+
+    Preguntarle al app-server cuesta levantar un proceso; mirar el directorio
+    de rollouts es un scandir. Se usa para detectar sesiones nuevas sin pagar
+    la consulta cara en cada tick.
+    """
+    total, ultimo = 0, 0.0
+    for home in homes:
+        raiz = os.path.join(home, "sessions")
+        for actual, _, archivos in os.walk(raiz):
+            for f in archivos:
+                if f.startswith("rollout-") and f.endswith(".jsonl"):
+                    total += 1
+                    try:
+                        ultimo = max(ultimo, os.path.getmtime(os.path.join(actual, f)))
+                    except OSError:
+                        pass
+    return (total, round(ultimo, 1))
+
+
 def _ui(stdscr, servidores, todos):
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -191,6 +220,12 @@ def _ui(stdscr, servidores, todos):
         cwd_actual = _ruta_corta({"cwd": os.getcwd()})
     except OSError:
         cwd_actual = None
+    homes = [srv.home for srv in servidores.values()]
+    huella = _huella_sesiones(homes)
+    # getch deja de bloquear: cada segundo y medio se mira si aparecio una
+    # sesion nueva. Hace falta porque al crear una desde la vista, Codex tarda
+    # en registrarla y la recarga posterior al lanzarla todavia no la ve.
+    stdscr.timeout(1500)
     while True:
         vistas = filtrar(sesiones, argparse.Namespace(
             grep=filtro, cwd=None, days=None, model=None))
@@ -199,7 +234,14 @@ def _ui(stdscr, servidores, todos):
         cursor = min(cursor, max(0, len(navegables) - 1))
         _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
                     archivadas, estado, todos, cwd_actual, vacios)
-        tecla = stdscr.getch(); previo = estado; estado = ""
+        tecla = stdscr.getch()
+        if tecla == -1:  # sin tecla: solo miramos si cambio algo en disco
+            actual_huella = _huella_sesiones(homes)
+            if actual_huella != huella:
+                huella = actual_huella
+                sesiones = cargar()
+            continue
+        previo = estado; estado = ""
 
         # Que hay bajo el cursor: un encabezado de directorio, o una sesion.
         tipo, valor = filas[navegables[cursor]] if navegables else (None, None)
@@ -225,7 +267,7 @@ def _ui(stdscr, servidores, todos):
                 marcadas.symmetric_difference_update({actual["id"]})
         elif tecla == ord("r") or tecla == ord("t"):
             if tecla == ord("t"): archivadas = not archivadas; cursor = 0
-            sesiones = cargar(); marcadas.clear()
+            sesiones = cargar(); marcadas.clear(); huella = _huella_sesiones(homes)
         elif tecla in (10, 13, curses.KEY_ENTER) and navegables:
             # Sobre un directorio, Enter arranca una sesion nueva ahi; sobre una
             # sesion, la reanuda. En ambos casos se sale de curses, corre Codex,
@@ -255,7 +297,7 @@ def _ui(stdscr, servidores, todos):
                 _, aviso = lanzar_codex(cmd, destino, entorno, nombre,
                                         actual["id"] if actual else None)
                 estado = aviso
-                sesiones = cargar(); marcadas.clear()
+                sesiones = cargar(); marcadas.clear(); huella = _huella_sesiones(homes)
             else:
                 stdscr.clear(); curses.endwin()
                 try:
@@ -264,7 +306,7 @@ def _ui(stdscr, servidores, todos):
                 finally:
                     stdscr.refresh()
                 estado = aviso
-                sesiones = cargar(); marcadas.clear()
+                sesiones = cargar(); marcadas.clear(); huella = _huella_sesiones(homes)
         elif tecla == ord("p"):
             if actual is None:
                 estado = "no hay preview de un directorio"

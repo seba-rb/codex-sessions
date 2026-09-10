@@ -148,6 +148,11 @@ foreground, and says so — there, quitting Codex does end the session.
 | `r` | reload |
 | `q` | quit |
 
+The list refreshes on its own: every second and a half it checks whether any
+rollout file appeared or changed — a `scandir`, not a request — and only then
+asks the app-server again. A session you start from the view shows up once
+Codex registers it, without pressing anything.
+
 Sessions are grouped by working directory, newest group first. The directory you
 launched from always shows up, even with no sessions yet, so you can start one
 there with `Enter`.
