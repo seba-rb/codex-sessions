@@ -1,3 +1,4 @@
+import unicodedata
 import sys
 import os
 import time
@@ -114,3 +115,30 @@ def _texto_sesion(sesion):
 _RELLENO = ("# AGENTS.md instructions", "<environment_context>",
             "<permissions instructions>", ">>> TRANSCRIPT START",
             "The following is the Codex agent history")
+
+
+def _ancho(texto):
+    """Columnas que ocupa en pantalla, no cantidad de caracteres.
+
+    Un emoji o un ideograma ocupan dos columnas: contarlos como uno descuadra
+    la fila entera hacia la derecha.
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in texto)
+
+
+def _recortar(texto, columnas):
+    """Recorta a lo que entra en esas columnas, midiendo por ancho visual."""
+    if columnas <= 0:
+        return ""
+    total, salida = 0, []
+    for c in texto:
+        w = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if total + w > columnas:
+            break
+        salida.append(c); total += w
+    return "".join(salida)
+
+
+def _limpiar(texto):
+    """Una linea sin caracteres de control: un \n o un \t rompen el dibujo."""
+    return " ".join(str(texto).split())

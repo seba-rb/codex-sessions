@@ -1,5 +1,6 @@
 import argparse
 import curses
+import locale
 import os
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from cx_sessions.comun import _ruta_corta
 from cx_sessions.comun import _texto_sesion
 from cx_sessions.appserver import borrar
 from cx_sessions.appserver import codex_bin
+from cx_sessions.comun import _ancho, _recortar, _limpiar
 
 
 
@@ -103,7 +105,7 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
         titulo += f"  \u2014 {resumen}"
     if marcadas:
         titulo += f" \u00b7 {len(marcadas)} marcadas"
-    stdscr.addnstr(0, 0, titulo, max(1, ancho - 1), curses.A_BOLD)
+    stdscr.addnstr(0, 0, _recortar(titulo, ancho - 1), max(1, ancho - 1), curses.A_BOLD)
     stdscr.addnstr(1, 0, "-" * max(1, ancho - 1), max(1, ancho - 1))
     cuerpo = max(1, alto - 5)
     fila_cursor = navegables[cursor] if navegables else 0
@@ -119,7 +121,8 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
             sufijo = "  (aqui)" if valor == cwd_actual else ""
             if valor in vacios:
                 sufijo += "  sin sesiones \u2014 Enter para crear una"
-            stdscr.addnstr(y, 0, f"{'>' if elegido else ' '} {valor}{sufijo}",
+            stdscr.addnstr(y, 0,
+                           _recortar(f"{'>' if elegido else ' '} {valor}{sufijo}", ancho - 1),
                            max(1, ancho - 1),
                            curses.A_BOLD | (curses.A_REVERSE if elegido else 0))
         else:
@@ -132,13 +135,15 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
             # hace que el addnstr posterior lo corte y no se vea nunca.
             aviso = ("  d otra vez para borrar"
                      if elegido and estado.startswith("d otra") else "")
-            hueco = max(10, ancho - 1 - len(aviso))
+            hueco = max(10, ancho - 1 - _ancho(aviso))
             est = estado_sesion(ses)
             texto = (f"{'>' if elegido else ' '}{marca} {corto(ses):8} {perfil}"
-                     f"{edad:>4}  {est:10} {_texto_sesion(ses)}")
-            texto = texto[:hueco]
+                     f"{edad:>4}  {est:10} {_limpiar(_texto_sesion(ses))}")
+            # Recorte por columnas, no por caracteres: un emoji ocupa dos y
+            # contarlo como uno corre toda la fila hacia la derecha.
+            texto = _recortar(texto, hueco)
             if aviso:
-                texto = texto.ljust(hueco) + aviso
+                texto += " " * max(0, hueco - _ancho(texto)) + aviso
             stdscr.addnstr(y, 0, texto, max(1, ancho - 1),
                            curses.A_REVERSE if elegido else 0)
         y += 1
@@ -491,4 +496,10 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
 
 
 def cmd_ui(servidores, todos=False):
+    # Requisito de curses en Python para UTF-8: sin esto los acentos salen
+    # partidos y el ancho de las filas se descuadra. Va antes de wrapper().
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
     curses.wrapper(lambda stdscr: _ui(stdscr, servidores, todos))
