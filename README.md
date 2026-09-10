@@ -107,6 +107,12 @@ the window in tmux's status bar — the viewer renames its own window to
 Closing Codex normally also brings you back: its window disappears and tmux
 returns to the list.
 
+Opening a session that's already open takes you to its window instead of trying
+again — Codex refuses a session that already has an active writer, and a second
+attempt would die on startup and close its own window, so from the outside it
+looked like `Enter` did nothing. If the session is open in a *different* tmux
+session, it says which one.
+
 Outside tmux it creates a detached session and attaches to it, so `Ctrl-b d`
 returns here. Without tmux installed it falls back to running in the
 foreground, and says so — there, quitting Codex does end the session.

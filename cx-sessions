@@ -961,16 +961,31 @@ def _ventana_de(thread_id):
     """
     if not (thread_id and os.environ.get("TMUX")):
         return None
+    # -a: todas las sesiones de tmux, no solo esta. La misma sesion de Codex
+    # puede estar abierta desde otra sesion de tmux (otra terminal, o una
+    # adjunta por ssh), y ahi tampoco se puede abrir dos veces.
     try:
         r = subprocess.run(
-            ["tmux", "list-windows", "-F", "#{window_id}\t#{@cx_session}"],
+            ["tmux", "list-windows", "-a", "-F",
+             "#{window_id}\t#{session_name}\t#{@cx_session}"],
             capture_output=True, text=True, check=True)
     except (subprocess.CalledProcessError, OSError):
         return None
+    actual = os.environ.get("TMUX_SESSION_NAME") or ""
+    if not actual:
+        try:
+            actual = subprocess.run(
+                ["tmux", "display-message", "-p", "#{session_name}"],
+                capture_output=True, text=True, check=True).stdout.strip()
+        except (subprocess.CalledProcessError, OSError):
+            actual = ""
     for linea in r.stdout.splitlines():
-        wid, _, sid = linea.partition("\t")
-        if sid.strip() == thread_id:
-            return wid
+        partes = linea.split("\t")
+        if len(partes) < 3:
+            continue
+        wid, sesion, sid = partes[0], partes[1], partes[2].strip()
+        if sid == thread_id:
+            return (wid, sesion == actual, sesion)
     return None
 
 
@@ -999,9 +1014,13 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
         # se cierra al instante, con lo que parece que Enter no hizo nada.
         ya = _ventana_de(thread_id)
         if ya:
-            subprocess.run(["tmux", "select-window", "-t", ya],
-                           capture_output=True, check=False)
-            return False, "esa sesion ya estaba abierta: te lleve a su ventana"
+            wid, aqui, sesion_tmux = ya
+            if aqui:
+                subprocess.run(["tmux", "select-window", "-t", wid],
+                               capture_output=True, check=False)
+                return False, "esa sesion ya estaba abierta: te lleve a su ventana"
+            return False, (f"ya esta abierta en la sesion tmux '{sesion_tmux}'; "
+                           "Codex no permite abrirla dos veces")
         # Ventana nueva en la misma sesion de tmux.
         tmux_cmd = ["tmux", "new-window", "-P", "-F", "#{window_id}", "-n", nombre]
         if cwd:
