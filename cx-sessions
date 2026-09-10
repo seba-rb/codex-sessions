@@ -688,7 +688,7 @@ def _ui(stdscr, servidores, todos):
                     # Con varios perfiles no hay uno "actual": se usa el primero,
                     # que es el que la cabecera lista por defecto.
                     entorno["CODEX_HOME"] = next(iter(servidores.values())).home
-                nombre = "codex-nuevo"
+                nombre = f"codex:{os.path.basename(destino.rstrip('/')) or 'nuevo'}"
             else:
                 destino = actual.get("cwd") or None
                 cmd = [codex_bin(), "resume", actual["id"]]
@@ -699,13 +699,15 @@ def _ui(stdscr, servidores, todos):
                 nombre = f"codex:{titulo_corto or corto(actual)}"
             if os.environ.get("TMUX"):
                 # La vista no se toca: Codex abre en otra ventana de tmux.
-                _, aviso = lanzar_codex(cmd, destino, entorno, nombre)
+                _, aviso = lanzar_codex(cmd, destino, entorno, nombre,
+                                        actual["id"] if actual else None)
                 estado = aviso
                 sesiones = cargar(); marcadas.clear()
             else:
                 stdscr.clear(); curses.endwin()
                 try:
-                    _, aviso = lanzar_codex(cmd, destino, entorno, nombre)
+                    _, aviso = lanzar_codex(cmd, destino, entorno, nombre,
+                                            actual["id"] if actual else None)
                 finally:
                     stdscr.refresh()
                 estado = aviso
@@ -951,7 +953,28 @@ def _hay_tmux():
     return shutil.which("tmux") is not None
 
 
-def lanzar_codex(cmd, cwd, entorno, nombre):
+def _ventana_de(thread_id):
+    """La ventana de tmux donde ya corre esa sesion, si existe.
+
+    Al crearla se le pone una opcion `@cx_session` con el id: buscar por nombre
+    no sirve porque el nombre es el titulo, que puede repetirse o cambiar.
+    """
+    if not (thread_id and os.environ.get("TMUX")):
+        return None
+    try:
+        r = subprocess.run(
+            ["tmux", "list-windows", "-F", "#{window_id}\t#{@cx_session}"],
+            capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    for linea in r.stdout.splitlines():
+        wid, _, sid = linea.partition("\t")
+        if sid.strip() == thread_id:
+            return wid
+    return None
+
+
+def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
     """Corre Codex de forma que volver a la vista no termine la sesion.
 
     En primer plano (subprocess.call) el proceso *es* la sesion: salir con
@@ -971,15 +994,35 @@ def lanzar_codex(cmd, cwd, entorno, nombre):
         subprocess.call(cmd, cwd=cwd, env=entorno)
         return True, "sin tmux: al salir de Codex la sesion termina"
     if os.environ.get("TMUX"):
-        # Ya estamos dentro de tmux: ventana nueva en la misma sesion.
-        tmux_cmd = ["tmux", "new-window", "-n", nombre]
+        # Si la sesion ya esta abierta, saltar a su ventana. Abrirla de nuevo
+        # no funciona —Codex rechaza una sesion con writer activo— y la ventana
+        # se cierra al instante, con lo que parece que Enter no hizo nada.
+        ya = _ventana_de(thread_id)
+        if ya:
+            subprocess.run(["tmux", "select-window", "-t", ya],
+                           capture_output=True, check=False)
+            return False, "esa sesion ya estaba abierta: te lleve a su ventana"
+        # Ventana nueva en la misma sesion de tmux.
+        tmux_cmd = ["tmux", "new-window", "-P", "-F", "#{window_id}", "-n", nombre]
         if cwd:
             tmux_cmd += ["-c", cwd]
         tmux_cmd += env_flags + ["--"] + cmd
         try:
-            subprocess.run(tmux_cmd, check=True, capture_output=True)
+            r = subprocess.run(tmux_cmd, check=True, capture_output=True, text=True)
         except (subprocess.CalledProcessError, OSError) as e:
             return True, f"no pude abrir la ventana tmux: {e}"
+        wid = r.stdout.strip()
+        if wid and thread_id:
+            # Marcar la ventana para poder volver a ella la proxima vez.
+            subprocess.run(["tmux", "set-window-option", "-t", wid,
+                            "@cx_session", thread_id],
+                           capture_output=True, check=False)
+        if wid:
+            # Sin esto, un Codex que falla al arrancar cierra la ventana antes
+            # de que se alcance a leer el error.
+            subprocess.run(["tmux", "set-window-option", "-t", wid,
+                            "remain-on-exit", "on"],
+                           capture_output=True, check=False)
         return False, "Codex abrio en otra ventana \u2014 Ctrl-b p (o Ctrl-b 0) vuelve aca"
     # Fuera de tmux: sesion propia, attach; al desatachar se vuelve a la vista.
     sesion = f"codex-{nombre}"
