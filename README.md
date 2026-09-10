@@ -88,10 +88,21 @@ matching `task_complete` means a turn is running.
 
 ### Opening a session doesn't tie it to this window
 
-Inside tmux, `Enter` opens Codex in a **new tmux window**, so going back is
-`Ctrl-b p` and the agent keeps working. That matters: if Codex ran in the
-foreground, the viewer's process would *be* the session and quitting with
-`Ctrl+D` would kill the work in progress.
+Inside tmux, `Enter` opens Codex in a **new tmux window**, and the agent keeps
+working when you leave it. That matters: if Codex ran in the foreground, the
+viewer's process would *be* the session, and quitting with `Ctrl+D` would kill
+the work in progress.
+
+To get back to the list without closing Codex: `Ctrl-b 0`, `Ctrl-b p`, or click
+the window in tmux's status bar — the viewer renames its own window to
+`sesiones`, and the Codex one to `codex:<session title>`, so the bar reads
+
+```
+0:sesiones  1:codex:Saludo inicial*
+```
+
+Closing Codex normally also brings you back: its window disappears and tmux
+returns to the list.
 
 Outside tmux it creates a detached session and attaches to it, so `Ctrl-b d`
 returns here. Without tmux installed it falls back to running in the

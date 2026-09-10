@@ -610,6 +610,15 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
 def _ui(stdscr, servidores, todos):
     curses.curs_set(0)
     stdscr.keypad(True)
+    # Nombrar la ventana propia: en la barra de tmux queda "0:sesiones" en vez
+    # de "0:python3.12", asi se ve —y con el mouse se clickea— para volver aca
+    # desde la ventana donde corre Codex.
+    if os.environ.get("TMUX"):
+        try:
+            subprocess.run(["tmux", "rename-window", "sesiones"],
+                           capture_output=True, check=False)
+        except OSError:
+            pass
     archivadas, filtro, marcadas, estado, cursor = False, "", set(), "", 0
     def cargar():
         out = []
@@ -684,7 +693,10 @@ def _ui(stdscr, servidores, todos):
                 destino = actual.get("cwd") or None
                 cmd = [codex_bin(), "resume", actual["id"]]
                 entorno = dict(os.environ, CODEX_HOME=actual["_codex_home"])
-                nombre = f"codex:{corto(actual)}"
+                # Nombre corto y legible: en la barra de tmux se lee mejor
+                # "codex:Saludo inicial" que el UUID.
+                titulo_corto = " ".join(_texto_sesion(actual).split()[:3])[:22]
+                nombre = f"codex:{titulo_corto or corto(actual)}"
             if os.environ.get("TMUX"):
                 # La vista no se toca: Codex abre en otra ventana de tmux.
                 _, aviso = lanzar_codex(cmd, destino, entorno, nombre)
@@ -968,7 +980,7 @@ def lanzar_codex(cmd, cwd, entorno, nombre):
             subprocess.run(tmux_cmd, check=True, capture_output=True)
         except (subprocess.CalledProcessError, OSError) as e:
             return True, f"no pude abrir la ventana tmux: {e}"
-        return False, "abierta en otra ventana \u2014 Ctrl-b p para volver aca"
+        return False, "Codex abrio en otra ventana \u2014 Ctrl-b p (o Ctrl-b 0) vuelve aca"
     # Fuera de tmux: sesion propia, attach; al desatachar se vuelve a la vista.
     sesion = f"codex-{nombre}"
     crear = ["tmux", "new-session", "-d", "-s", sesion]
