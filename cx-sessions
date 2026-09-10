@@ -154,7 +154,7 @@ def imprimir(sesiones, mostrar_ruta=False):
         cwd = str(s.get("cwd") or "")
         if cwd.startswith(home):
             cwd = "~" + cwd[len(home):]
-        huerfana = " [huerfana]" if s.get("path") and not os.path.isfile(s["path"]) else ""
+        huerfana = " [orphaned]" if s.get("path") and not os.path.isfile(s["path"]) else ""
         print(f"  {corto(s)}  {edad}  {etiqueta(s):<60}  {cwd}{huerfana}")
         if mostrar_ruta:
             print(f"            {s.get('id')}  {s.get('path')}")
@@ -364,8 +364,11 @@ def cmd_prune(srv, args):
 # Eventos del rollout que marcan el ciclo de vida de una sesion. El resto
 # (item_completed, token_count) es ruido de progreso y se ignora.
 _CICLO = ("task_started", "task_complete", "turn_aborted")
-_ETIQUETA = {"task_started": "trabajando", "task_complete": "lista",
-             "turn_aborted": "cortada"}
+# Nombres en ingles y pegados al vocabulario del propio Codex: su protocolo
+# usa active / complete para el ciclo de vida de un turno, y su vista de
+# agentes habla de working / ready. Traducirlos solo agregaria un dialecto mas.
+_ETIQUETA = {"task_started": "active", "task_complete": "complete",
+             "turn_aborted": "aborted"}
 # El ultimo evento se busca leyendo el final del archivo. 64KB alcanzan casi
 # siempre, pero un rollout largo puede tener megabytes de ruido despues del
 # task_started, asi que la ventana crece hasta leerlo entero antes de rendirse.
@@ -421,7 +424,7 @@ def estado_sesion(sesion):
     try:
         st = os.stat(path)
     except OSError:
-        return "huerfana"
+        return "orphaned"
     clave = (path, st.st_mtime, st.st_size)
     if clave in _cache_estado:
         return _cache_estado[clave]
@@ -430,7 +433,7 @@ def estado_sesion(sesion):
     # Un task_started sin cierre y sin escrituras recientes es casi siempre un
     # proceso que murio, no una sesion pensando.
     if evento == "task_started" and (time.time() - st.st_mtime) > 300:
-        etiqueta_ = "colgada?"
+        etiqueta_ = "stalled"
     _cache_estado[clave] = etiqueta_
     return etiqueta_
 
@@ -439,11 +442,8 @@ def resumen_estados(sesiones):
     """`3 trabajando · 12 listas`, omitiendo lo que este en cero."""
     from collections import Counter
     cuenta = Counter(e for e in (estado_sesion(s) for s in sesiones) if e)
-    orden = ("trabajando", "colgada?", "lista", "cortada", "huerfana")
-    plural = {"lista": "listas", "cortada": "cortadas", "huerfana": "huerfanas",
-              "colgada?": "colgadas?", "trabajando": "trabajando"}
-    partes = [f"{cuenta[e]} {e if cuenta[e] == 1 else plural[e]}"
-              for e in orden if cuenta.get(e)]
+    orden = ("active", "stalled", "complete", "aborted", "orphaned")
+    partes = [f"{cuenta[e]} {e}" for e in orden if cuenta.get(e)]
     return " \u00b7 ".join(partes)
 
 

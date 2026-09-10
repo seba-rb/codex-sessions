@@ -70,15 +70,18 @@ somewhere else.
 ### Session status
 
 Each session shows a status, and the header sums them up
-(`2 trabajando · 11 listas`):
+(`2 active · 11 complete`):
 
 | Status | Meaning |
 |---|---|
-| `trabajando` | a turn is in flight |
-| `colgada?` | a turn started but nothing has been written for 5 minutes — the process probably died |
-| `lista` | the last turn finished |
-| `cortada` | the turn was aborted |
-| `huerfana` | the row is there but its rollout file is gone |
+| `active` | a turn is in flight |
+| `stalled` | a turn started but nothing has been written for 5 minutes — the process probably died |
+| `complete` | the last turn finished |
+| `aborted` | the turn was aborted |
+| `orphaned` | the row is there but its rollout file is gone |
+
+The names follow Codex's own vocabulary — its protocol uses `active` and
+`complete` for a turn's lifecycle — rather than inventing a parallel one.
 
 These come from the rollout file, not from Codex's daemon. The daemon is the
 only thing that knows live state, but its control socket does not speak the
