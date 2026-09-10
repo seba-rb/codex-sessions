@@ -315,6 +315,65 @@ def _hay_tmux():
     return shutil.which("tmux") is not None
 
 
+def _sesion_tmux_actual():
+    try:
+        return subprocess.run(["tmux", "display-message", "-p", "#{session_name}"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+
+
+def _pid_con_writer(codex_home, thread_id):
+    """El proceso que tiene tomado el writer de esa sesion, si hay alguno.
+
+    Codex mantiene un lock por sesion en <CODEX_HOME>/thread-writer-locks/.
+    Mirarlo cubre casos que la marca de tmux no puede: una sesion **creada**
+    desde la vista (Enter sobre un directorio) todavia no tenia id cuando se
+    abrio su ventana, asi que quedo sin marcar.
+    """
+    if not (codex_home and thread_id):
+        return None
+    lock = os.path.join(codex_home, "thread-writer-locks", f"{thread_id}.lock")
+    if not os.path.exists(lock):
+        return None
+    try:
+        r = subprocess.run(["lsof", "-t", lock], capture_output=True, text=True)
+    except OSError:
+        return None
+    pids = [int(x) for x in r.stdout.split() if x.isdigit()]
+    return pids[0] if pids else None
+
+
+def _ventana_del_pid(pid):
+    """La ventana de tmux en cuyo arbol de procesos vive ese pid."""
+    if not pid:
+        return None
+    try:
+        r = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{window_id}\t#{session_name}"],
+            capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    panes = {}
+    for linea in r.stdout.splitlines():
+        partes = linea.split("\t")
+        if len(partes) >= 3 and partes[0].isdigit():
+            panes[int(partes[0])] = (partes[1], partes[2])
+    # subir por los padres hasta dar con el proceso de algun pane
+    visto, actual = set(), pid
+    while actual and actual > 1 and actual not in visto:
+        visto.add(actual)
+        if actual in panes:
+            return panes[actual]
+        try:
+            salida = subprocess.run(["ps", "-o", "ppid=", "-p", str(actual)],
+                                    capture_output=True, text=True).stdout.strip()
+            actual = int(salida) if salida.isdigit() else None
+        except (OSError, ValueError):
+            return None
+    return None
+
+
 def _ventana_de(thread_id):
     """La ventana de tmux donde ya corre esa sesion, si existe.
 
@@ -333,14 +392,7 @@ def _ventana_de(thread_id):
             capture_output=True, text=True, check=True)
     except (subprocess.CalledProcessError, OSError):
         return None
-    actual = os.environ.get("TMUX_SESSION_NAME") or ""
-    if not actual:
-        try:
-            actual = subprocess.run(
-                ["tmux", "display-message", "-p", "#{session_name}"],
-                capture_output=True, text=True, check=True).stdout.strip()
-        except (subprocess.CalledProcessError, OSError):
-            actual = ""
+    actual = _sesion_tmux_actual()
     for linea in r.stdout.splitlines():
         partes = linea.split("\t")
         if len(partes) < 3:
@@ -374,7 +426,21 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
         # Si la sesion ya esta abierta, saltar a su ventana. Abrirla de nuevo
         # no funciona —Codex rechaza una sesion con writer activo— y la ventana
         # se cierra al instante, con lo que parece que Enter no hizo nada.
+        # Primero la marca @cx_session; si no esta —tipico de una sesion creada
+        # desde la vista, que no tenia id cuando se abrio su ventana— se busca
+        # por el proceso que tiene tomado el writer.
         ya = _ventana_de(thread_id)
+        if not ya:
+            porproceso = _ventana_del_pid(
+                _pid_con_writer(entorno.get("CODEX_HOME"), thread_id))
+            if porproceso:
+                wid, sesion_tmux = porproceso
+                actual = _sesion_tmux_actual()
+                ya = (wid, sesion_tmux == actual, sesion_tmux)
+                # marcarla ahora, para no tener que rastrear el proceso de nuevo
+                subprocess.run(["tmux", "set-window-option", "-t", wid,
+                                "@cx_session", thread_id],
+                               capture_output=True, check=False)
         if ya:
             wid, aqui, sesion_tmux = ya
             if aqui:
@@ -383,6 +449,11 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
                 return False, "esa sesion ya estaba abierta: te lleve a su ventana"
             return False, (f"ya esta abierta en la sesion tmux '{sesion_tmux}'; "
                            "Codex no permite abrirla dos veces")
+        # Sin ventana pero con writer tomado: un Codex fuera de tmux.
+        pid = _pid_con_writer(entorno.get("CODEX_HOME"), thread_id)
+        if pid:
+            return False, (f"la tiene abierta el proceso {pid}, fuera de tmux; "
+                           "cerralo o usa otra sesion")
         # Ventana nueva en la misma sesion de tmux.
         tmux_cmd = ["tmux", "new-window", "-P", "-F", "#{window_id}", "-n", nombre]
         if cwd:
