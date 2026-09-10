@@ -4,3 +4,4 @@
 __pycache__/
 *.v[0-9].*
 cx-sessions.v*
+__pycache__/

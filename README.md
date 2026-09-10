@@ -29,6 +29,21 @@ git clone https://github.com/seba-rb/codex-sessions.git
 ln -s "$PWD/codex-sessions/cx-sessions" ~/.local/bin/cx-sessions
 ```
 
+The executable is a stub that imports the `cx_sessions` package sitting next to
+it, resolving through the symlink, so there's nothing to install and nothing on
+`PYTHONPATH`:
+
+```
+cx-sessions          # entry point
+cx_sessions/
+  appserver.py       # app-server client: AppServer, RpcError
+  comun.py           # formatting, filtering, shared helpers
+  estado.py          # status derived from rollout files
+  nombres.py         # automatic session titles
+  vista.py           # the curses view
+  comandos.py        # ls / rm / prune / rename and argument parsing
+```
+
 ## Use
 
 ```bash
