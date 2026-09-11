@@ -103,7 +103,7 @@ def borrar(srv, sesion):
         return True, None
     except RpcError as e:
         if not e.metodo_desconocido:
-            return False, explicar_error(e.msg, srv.home)
+            return False, explicar_error(e.msg)
         r = subprocess.run([codex_bin(), "delete", "--force", sesion["id"]],
                            capture_output=True, text=True,
                            env=dict(os.environ, CODEX_HOME=srv.home))

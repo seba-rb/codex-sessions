@@ -12,6 +12,7 @@ from .appserver import RpcError
 from cx_sessions.comun import _ruta_corta
 from cx_sessions.comun import _texto_sesion
 from cx_sessions.appserver import borrar
+from cx_sessions.forzado import borrar_forzado, hay_writer, pid_con_writer
 from cx_sessions.appserver import codex_bin
 from cx_sessions.comun import _ancho, _recortar, _limpiar
 
@@ -161,7 +162,7 @@ def _dibujar_ui(stdscr, vistas, filas, navegables, cursor, marcadas, filtro,
     en_grupo = bool(navegables) and filas[fila_cursor][0] == "grupo"
     ayuda = ("Enter sesion nueva aqui \u00b7 j/k mover \u00b7 / filtrar \u00b7 q salir"
              if en_grupo else
-             "Enter abrir \u00b7 p preview \u00b7 d borrar \u00b7 a archivar \u00b7 / filtrar")
+             "Enter abrir \u00b7 p preview \u00b7 d borrar \u00b7 D forzar \u00b7 a archivar \u00b7 / filtrar")
     stdscr.addnstr(alto - 1, 0, ayuda, max(1, ancho - 1), curses.A_DIM)
     if estado and not estado.startswith("d otra"):
         stdscr.addnstr(alto - 4, 0, estado, max(1, ancho - 1), curses.A_BOLD)
@@ -350,12 +351,94 @@ def _ui(stdscr, servidores, todos):
                 continue
             armado = previo.startswith("d otra")
             if armado:
+                trabadas = []
                 for s in elegidas:
                     ok, err = borrar(s["_srv"], s)
                     if ok: sesiones.remove(s); marcadas.discard(s["id"])
+                    elif hay_writer(s["_codex_home"], s["id"]): trabadas.append(s)
                     else: estado = err or "fallo al borrar"
+                if trabadas:
+                    estado = _aviso_trabadas(trabadas)
             else:
                 estado = f"d otra vez para borrar {len(elegidas)} sesiones" if len(elegidas) > 1 else "d otra vez para borrar"
+        elif tecla == ord("D"):
+            elegidas = [s for s in vistas if s["id"] in marcadas]
+            if not elegidas and actual is not None:
+                elegidas = [actual]
+            if not elegidas:
+                estado = "borrar no aplica a un directorio"
+                continue
+            if previo.startswith("D otra"):
+                # Puede tardar unos segundos si el proceso no se muere solo, y
+                # sin esto la vista parece colgada.
+                _avisar(stdscr, f"forzando el borrado de {len(elegidas)}...")
+                for s in elegidas:
+                    ventana = _ventana_de(s["id"])
+                    ok, err = borrar_forzado(s["_srv"], s)
+                    if not ok:
+                        estado = err or "fallo al forzar el borrado"
+                        continue
+                    _cerrar_ventana(ventana)
+                    sesiones.remove(s); marcadas.discard(s["id"])
+            else:
+                estado = _aviso_forzar(elegidas)
+
+
+def _avisar(stdscr, texto):
+    """Un estado que se ve ya, sin esperar a la proxima vuelta del loop."""
+    alto, ancho = stdscr.getmaxyx()
+    try:
+        stdscr.addnstr(alto - 4, 0, texto.ljust(max(1, ancho - 1)), max(1, ancho - 1),
+                       curses.A_BOLD)
+        stdscr.refresh()
+    except curses.error:
+        pass
+
+
+def _cerrar_ventana(ventana):
+    """Cierra la ventana tmux que quedo sin proceso.
+
+    Las ventanas que abre la vista llevan `remain-on-exit on` —para poder leer
+    el error de un Codex que no arranca—, asi que matar el proceso no las
+    cierra: queda un panel muerto de una sesion que ya no existe.
+
+    Solo se cierran las que la vista marco con `@cx_session`. Rastrear la
+    ventana por el pid del writer alcanzaria mas casos, pero tambien podria
+    dar con una que el usuario abrio a mano y usa para otra cosa.
+    """
+    if not ventana:
+        return
+    subprocess.run(["tmux", "kill-window", "-t", ventana[0]],
+                   capture_output=True, check=False)
+
+
+def _quien_la_tiene(sesion):
+    """Como nombrarle al usuario el proceso que bloquea el borrado.
+
+    Sin lsof se sabe que esta tomada pero no por quien; decirlo asi es mas
+    honesto que callarlo, porque en ese caso el forzado tampoco va a poder.
+    """
+    home, tid = sesion.get("_codex_home"), sesion.get("id")
+    pid = pid_con_writer(home, tid)
+    if not pid:
+        return "otro proceso" if hay_writer(home, tid) else ""
+    ventana = _ventana_del_pid(pid)
+    return f"la ventana {ventana[1]}:{ventana[0]}" if ventana else f"el pid {pid}"
+
+
+def _aviso_trabadas(sesiones):
+    if len(sesiones) == 1:
+        quien = _quien_la_tiene(sesiones[0]) or "otro proceso"
+        return f"la tiene abierta {quien} \u2014 D para forzar (lo mata)"
+    return f"{len(sesiones)} abiertas en otro proceso \u2014 D para forzar (los mata)"
+
+
+def _aviso_forzar(sesiones):
+    if len(sesiones) == 1:
+        quien = _quien_la_tiene(sesiones[0])
+        cola = f": mata {quien} y borra" if quien else " (nadie la tiene abierta)"
+        return f"D otra vez para forzar{cola}"
+    return f"D otra vez para forzar {len(sesiones)} sesiones: mata lo que las tenga abiertas"
 
 
 def _hay_tmux():
@@ -368,27 +451,6 @@ def _sesion_tmux_actual():
                               capture_output=True, text=True, check=True).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         return ""
-
-
-def _pid_con_writer(codex_home, thread_id):
-    """El proceso que tiene tomado el writer de esa sesion, si hay alguno.
-
-    Codex mantiene un lock por sesion en <CODEX_HOME>/thread-writer-locks/.
-    Mirarlo cubre casos que la marca de tmux no puede: una sesion **creada**
-    desde la vista (Enter sobre un directorio) todavia no tenia id cuando se
-    abrio su ventana, asi que quedo sin marcar.
-    """
-    if not (codex_home and thread_id):
-        return None
-    lock = os.path.join(codex_home, "thread-writer-locks", f"{thread_id}.lock")
-    if not os.path.exists(lock):
-        return None
-    try:
-        r = subprocess.run(["lsof", "-t", lock], capture_output=True, text=True)
-    except OSError:
-        return None
-    pids = [int(x) for x in r.stdout.split() if x.isdigit()]
-    return pids[0] if pids else None
 
 
 def _ventana_del_pid(pid):
@@ -479,7 +541,7 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
         ya = _ventana_de(thread_id)
         if not ya:
             porproceso = _ventana_del_pid(
-                _pid_con_writer(entorno.get("CODEX_HOME"), thread_id))
+                pid_con_writer(entorno.get("CODEX_HOME"), thread_id))
             if porproceso:
                 wid, sesion_tmux = porproceso
                 actual = _sesion_tmux_actual()
@@ -497,7 +559,7 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
             return False, (f"ya esta abierta en la sesion tmux '{sesion_tmux}'; "
                            "Codex no permite abrirla dos veces")
         # Sin ventana pero con writer tomado: un Codex fuera de tmux.
-        pid = _pid_con_writer(entorno.get("CODEX_HOME"), thread_id)
+        pid = pid_con_writer(entorno.get("CODEX_HOME"), thread_id)
         if pid:
             return False, (f"la tiene abierta el proceso {pid}, fuera de tmux; "
                            "cerralo o usa otra sesion")

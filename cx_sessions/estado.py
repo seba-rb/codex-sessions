@@ -47,6 +47,33 @@ def purgar_huerfanas(codex_home, ids, aplicar):
         for tid in ids:
             con.execute("delete from threads where id = ?", (tid,))
 
+
+def borrar_fila(codex_home, thread_id):
+    """Saca una sesion de la base sin pasar por la API.
+
+    Solo para cuando `thread/delete` no es una opcion. Las tablas que cuelgan
+    de `threads` declaran ON DELETE CASCADE, que SQLite ignora si no se
+    enciende el pragma; `thread_spawn_edges` ni siquiera lo declara, asi que
+    sus filas se limpian a mano.
+    """
+    db = _base_estado(codex_home)
+    if db is None:
+        return False, "no encontre la base de sesiones"
+    con = sqlite3.connect(db)
+    try:
+        con.execute("pragma foreign_keys = on")
+        with con:
+            con.execute("delete from threads where id = ?", (thread_id,))
+            con.execute("delete from thread_spawn_edges "
+                        "where child_thread_id = ? or parent_thread_id = ?",
+                        (thread_id, thread_id))
+    except sqlite3.Error as e:
+        return False, f"la base rechazo el borrado: {e}"
+    finally:
+        con.close()
+    return True, None
+
+
 # Eventos del rollout que marcan el ciclo de vida de una sesion. El resto
 # (item_completed, token_count) es ruido de progreso y se ignora.
 _CICLO = ("task_started", "task_complete", "turn_aborted")

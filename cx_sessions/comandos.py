@@ -12,6 +12,7 @@ from .vista import cmd_ui
 import subprocess
 from cx_sessions.comun import _texto_sesion
 from cx_sessions.appserver import borrar
+from cx_sessions.forzado import borrar_forzado, hay_writer
 from cx_sessions.comun import resolver
 
 
@@ -47,16 +48,23 @@ def cmd_rm(srv, args):
     if not elegidas:
         return 1
     imprimir(elegidas)
+    if args.force:
+        vivos = [s for s in elegidas if hay_writer(srv.home, s["id"])]
+        if vivos:
+            print(f"\n{len(vivos)} esta(n) abierta(s) en otro proceso: --force lo mata "
+                  "para poder borrarlas.")
     if not args.yes and not confirmar(elegidas):
         print("Cancelado.")
         return 0
     fallos = 0
     for s in elegidas:
-        ok, err = borrar(srv, s)
+        ok, err = (borrar_forzado(srv, s) if args.force else borrar(srv, s))
         if ok:
             print(f"  borrada  {corto(s)}  {etiqueta(s)}")
         else:
             fallos += 1
+            if not args.force and hay_writer(srv.home, s["id"]):
+                err = f"{err} Borrala igual con: cx-sessions rm --force {corto(s)}"
             print(f"  FALLO    {corto(s)}  {err}", file=sys.stderr)
     return 1 if fallos else 0
 
@@ -242,6 +250,8 @@ def main():
     p = sub.add_parser("rm", help="borrar sesiones por id o prefijo")
     p.add_argument("refs", nargs="+", metavar="ID", help="UUID completo o prefijo")
     p.add_argument("--yes", "-y", action="store_true", help="sin confirmacion")
+    p.add_argument("--force", "-f", action="store_true",
+                   help="borrar aunque este abierta: mata al proceso que la tiene")
 
     p = sub.add_parser("prune", help="purgar sesiones viejas y filas huerfanas")
     p.add_argument("--older-than", type=float, metavar="N", help="borrar las de mas de N dias")

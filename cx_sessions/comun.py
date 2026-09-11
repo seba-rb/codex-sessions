@@ -93,12 +93,10 @@ def resolver(sesiones, refs):
     return elegidas, faltan
 
 
-def explicar_error(msg, codex_home):
+def explicar_error(msg):
     """Traduce los errores crudos del app-server a algo accionable."""
     if "active writer" in msg:
-        return ("la sesion esta abierta en otro proceso. Cerrala donde la tengas "
-                "abierta, o reinicia el daemon: pkill -f "
-                f"'{codex_home}/packages/standalone/current/codex app-server'")
+        return "la sesion esta abierta en otro proceso."
     if "no rollout found" in msg:
         return ("fila huerfana: el .jsonl ya no esta. Limpiala con "
                 "cx-sessions prune --orphans --apply")

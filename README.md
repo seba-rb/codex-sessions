@@ -39,6 +39,7 @@ cx_sessions/
   appserver.py       # app-server client: AppServer, RpcError
   comun.py           # formatting, filtering, shared helpers
   estado.py          # status derived from rollout files
+  forzado.py         # forced delete: evicting the writer that blocks it
   nombres.py         # automatic session titles
   vista.py           # the curses view
   comandos.py        # ls / rm / prune / rename and argument parsing
@@ -52,6 +53,7 @@ cx-sessions ls                  # plain listing
 cx-sessions ls --cwd ~/code/api --days 7
 cx-sessions ls -g "webhook"     # search title, preview and cwd
 cx-sessions rm 019d412b         # by UUID prefix, asks to confirm
+cx-sessions rm --force 019d412b # even if open elsewhere (kills that process)
 cx-sessions prune --older-than 90 --apply
 cx-sessions prune --orphans --apply
 
@@ -142,6 +144,7 @@ foreground, and says so — there, quitting Codex does end the session.
 | `Enter` | on a session, resume it; on a directory, start a new session there |
 | `p` | preview |
 | `d` | arm delete; `d` again confirms |
+| `D` | arm forced delete; `D` again kills whatever holds the session open, then deletes |
 | `a` | archive / unarchive |
 | `/` | incremental filter — `Enter` applies, `Esc` cancels |
 | `t` | toggle active / archived |
@@ -160,6 +163,35 @@ there with `Enter`.
 Deleting takes two keystrokes rather than a modal: the first `d` arms it and says
 so on the row, the second one does it, and any other key cancels.
 
+### Deleting a session that's open somewhere else
+
+`thread/delete` refuses a session that `already has an active writer`, and until
+now that left you hunting for the window holding it. `D` deletes it anyway.
+
+It has to kill that process, and there's no way around it: the `threads` row is
+persisted with an `INSERT ... ON CONFLICT(id) DO UPDATE`, so deleting the row
+underneath a live Codex only lasts until its next turn writes it back. So `D`
+sends `SIGTERM` first — giving Codex the chance to close its rollout cleanly —
+falls back to `SIGKILL` if the lock is still held five seconds later, and only
+then deletes. Once the writer is gone it retries `thread/delete`: with the lock
+free, the API does a more thorough cleanup than we could.
+
+Because it kills a possibly-working agent, it arms like `d` does: the first `D`
+names the victim — the tmux window holding it, or the bare pid if it's outside
+tmux — and the second one goes through. A failed `d` points at it too, so the
+same message says why the delete bounced and what to do about it.
+
+Finding out *whether* a session is held needs nothing installed: asking the
+kernel for the same `flock` Codex holds answers that. Naming the process, and so
+killing it, needs `lsof`. Without it the view still tells you the session is
+open, and the forced delete stops there instead of pulling the row out from
+under a live Codex — which would only last until its next turn wrote it back.
+
+If the session was opened from this view, its tmux window is closed as well —
+those windows carry `remain-on-exit on`, so killing the process would otherwise
+leave a dead pane behind. Only windows the view itself tagged are closed; one
+you opened by hand is left alone.
+
 ## Why it talks to the app-server
 
 Session state lives in `state_5.sqlite` under your `CODEX_HOME`, and reading it
@@ -173,14 +205,18 @@ The one exception is `prune --orphans`. `thread/delete` requires the rollout fil
 to exist; a row whose `.jsonl` is gone can't be deleted through the API and stays
 stuck in your list forever (see
 [openai/codex#36558](https://github.com/openai/codex/issues/36558)). That command
-is the only one that writes to the database, and it backs it up first.
+writes to the database directly, and it backs it up first.
+
+`rm --force` can end up there too, but only as a last resort: it retries the API
+after freeing the lock, and touches the tables by hand only if that still fails.
 
 ## Known Codex quirks this surfaces
 
-- **`already has an active writer`** when deleting: a process still holds that
-  session open — usually the long-lived `codex app-server` daemon, which keeps a
-  lock per session under `<CODEX_HOME>/thread-writer-locks/` and doesn't release
-  it when you `/quit`. Restart that daemon to free it.
+- **`already has an active writer`** when deleting: some process still holds the
+  session open — a Codex running in another window, or the long-lived
+  `codex app-server` daemon, which doesn't release the lock when you `/quit`.
+  The lock is an `flock` on `<CODEX_HOME>/thread-writer-locks/<id>.lock`, so
+  `lsof` names the culprit. `D` in the view, or `rm --force`, deletes anyway.
 - **Skills are invoked with `$name`, not `/name`** in Codex
   ([openai/codex#11817](https://github.com/openai/codex/issues/11817), closed as
   not planned). Unrelated to this tool, but it trips up everyone coming from
