@@ -127,8 +127,14 @@ returns to the list.
 Opening a session that's already open takes you to its window instead of trying
 again — Codex refuses a session that already has an active writer, and a second
 attempt would die on startup and close its own window, so from the outside it
-looked like `Enter` did nothing. If the session is open in a *different* tmux
-session, it says which one.
+looked like `Enter` did nothing.
+
+When its window isn't one you can be taken to — another tmux session, or a Codex
+running in a plain terminal tab with no tmux window at all — `Enter` offers to
+take the session over instead of leaving you stuck: it names where the process is
+(the terminal app and tty, so you can go find it if you'd rather), and a second
+`Enter` closes it and opens the session here. That's the only way to actually
+open it, since Codex allows one writer at a time.
 
 Outside tmux it creates a detached session and attaches to it, so `Ctrl-b d`
 returns here. Without tmux installed it falls back to running in the
@@ -141,7 +147,7 @@ foreground, and says so — there, quitting Codex does end the session.
 | `↑` `↓` / `k` `j` | move between directories and sessions |
 | `PgUp` `PgDn`, `g` `G` | page and jump to ends |
 | `space` | select / deselect |
-| `Enter` | on a session, resume it; on a directory, start a new session there |
+| `Enter` | on a session, resume it; on a directory, start a new session there. If it's open elsewhere, `Enter` again takes it over |
 | `p` | preview |
 | `d` | arm delete; `d` again confirms |
 | `D` | arm forced delete; `D` again kills whatever holds the session open, then deletes |

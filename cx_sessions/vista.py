@@ -12,7 +12,8 @@ from .appserver import RpcError
 from cx_sessions.comun import _ruta_corta
 from cx_sessions.comun import _texto_sesion
 from cx_sessions.appserver import borrar
-from cx_sessions.forzado import borrar_forzado, hay_writer, pid_con_writer
+from cx_sessions.forzado import (borrar_forzado, hay_writer, pid_con_writer,
+                                 terminar_writer)
 from cx_sessions.appserver import codex_bin
 from cx_sessions.comun import _ancho, _recortar, _limpiar
 
@@ -293,17 +294,23 @@ def _ui(stdscr, servidores, todos):
                 # "codex:Saludo inicial" que el UUID.
                 titulo_corto = " ".join(_texto_sesion(actual).split()[:3])[:22]
                 nombre = f"codex:{titulo_corto or corto(actual)}"
+            # Una sesion abierta en otro lado no se puede abrir dos veces; el
+            # aviso anterior ofrecio tomarla, y este Enter es el que lo acepta.
+            # Prefijo y no prosa suelta: el aviso de un `d` que fallo tambien
+            # habla de una sesion abierta en otro proceso, y no es una oferta
+            # de matarlo.
+            tomar = previo.startswith("Enter otra")
             if os.environ.get("TMUX"):
                 # La vista no se toca: Codex abre en otra ventana de tmux.
                 _, aviso = lanzar_codex(cmd, destino, entorno, nombre,
-                                        actual["id"] if actual else None)
+                                        actual["id"] if actual else None, tomar)
                 estado = aviso
                 sesiones = cargar(); marcadas.clear(); huella = _huella_sesiones(homes)
             else:
                 stdscr.clear(); curses.endwin()
                 try:
                     _, aviso = lanzar_codex(cmd, destino, entorno, nombre,
-                                            actual["id"] if actual else None)
+                                            actual["id"] if actual else None, tomar)
                 finally:
                     stdscr.refresh()
                 estado = aviso
@@ -378,7 +385,7 @@ def _ui(stdscr, servidores, todos):
                     if not ok:
                         estado = err or "fallo al forzar el borrado"
                         continue
-                    _cerrar_ventana(ventana)
+                    _cerrar_ventana(ventana[0] if ventana else None)
                     sesiones.remove(s); marcadas.discard(s["id"])
             else:
                 estado = _aviso_forzar(elegidas)
@@ -395,7 +402,7 @@ def _avisar(stdscr, texto):
         pass
 
 
-def _cerrar_ventana(ventana):
+def _cerrar_ventana(wid):
     """Cierra la ventana tmux que quedo sin proceso.
 
     Las ventanas que abre la vista llevan `remain-on-exit on` —para poder leer
@@ -406,9 +413,9 @@ def _cerrar_ventana(ventana):
     ventana por el pid del writer alcanzaria mas casos, pero tambien podria
     dar con una que el usuario abrio a mano y usa para otra cosa.
     """
-    if not ventana:
+    if not wid:
         return
-    subprocess.run(["tmux", "kill-window", "-t", ventana[0]],
+    subprocess.run(["tmux", "kill-window", "-t", wid],
                    capture_output=True, check=False)
 
 
@@ -451,6 +458,60 @@ def _sesion_tmux_actual():
                               capture_output=True, text=True, check=True).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         return ""
+
+
+# Terminales donde puede estar corriendo un Codex fuera de tmux. Nombrar la
+# aplicacion es lo que convierte "el proceso 3543" en algo que el usuario puede
+# ir a buscar.
+_APPS = {"iTerm2": "iTerm2", "Terminal.app": "Terminal", "ghostty": "Ghostty",
+         "alacritty": "Alacritty", "kitty": "kitty", "wezterm": "WezTerm",
+         "warp": "Warp", "Hyper": "Hyper"}
+# tmux no esta en la tabla a proposito: a esta descripcion solo se llega cuando
+# no se encontro una ventana de tmux, asi que nombrarlo se contradice.
+
+
+def _app_del_pid(pid):
+    """La terminal en cuyo arbol de procesos vive ese pid, si se reconoce."""
+    visto, actual = set(), pid
+    while actual and actual > 1 and actual not in visto:
+        visto.add(actual)
+        try:
+            salida = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(actual)],
+                                    capture_output=True, text=True).stdout.strip()
+        except OSError:
+            return ""
+        partes = salida.split(None, 1)
+        if len(partes) < 2:
+            return ""
+        for aguja, nombre in _APPS.items():
+            if aguja in partes[1]:
+                return nombre
+        actual = int(partes[0]) if partes[0].isdigit() else None
+    return ""
+
+
+def _donde_corre(pid):
+    """Como describirle al usuario donde esta ese proceso."""
+    try:
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout.strip()
+    except OSError:
+        tty = ""
+    donde = [x for x in (_app_del_pid(pid), f"tty {tty}" if tty and tty != "??" else "") if x]
+    return f"el proceso {pid}" + (f", en {', '.join(donde)}" if donde else "")
+
+
+def _tomar(codex_home, thread_id):
+    """Deja la sesion libre para poder abrirla aca.
+
+    Codex rechaza una sesion que ya tiene writer, asi que "abrirla igual" no es
+    una opcion: hay que cerrar al que la tiene. SIGTERM primero, para que
+    guarde y salga ordenado.
+    """
+    ok, err, _ = terminar_writer(codex_home, thread_id)
+    if not ok:
+        return False, f"no pude liberarla: {err}"
+    return True, None
 
 
 def _ventana_del_pid(pid):
@@ -512,7 +573,7 @@ def _ventana_de(thread_id):
     return None
 
 
-def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
+def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None, tomar=False):
     """Corre Codex de forma que volver a la vista no termine la sesion.
 
     En primer plano (subprocess.call) el proceso *es* la sesion: salir con
@@ -556,13 +617,25 @@ def lanzar_codex(cmd, cwd, entorno, nombre, thread_id=None):
                 subprocess.run(["tmux", "select-window", "-t", wid],
                                capture_output=True, check=False)
                 return False, "esa sesion ya estaba abierta: te lleve a su ventana"
-            return False, (f"ya esta abierta en la sesion tmux '{sesion_tmux}'; "
-                           "Codex no permite abrirla dos veces")
-        # Sin ventana pero con writer tomado: un Codex fuera de tmux.
-        pid = pid_con_writer(entorno.get("CODEX_HOME"), thread_id)
-        if pid:
-            return False, (f"la tiene abierta el proceso {pid}, fuera de tmux; "
-                           "cerralo o usa otra sesion")
+            if not tomar:
+                return False, ("Enter otra vez para tomarla aca: esta abierta en la "
+                               f"sesion tmux '{sesion_tmux}', y se cerraria alla")
+            ok, err = _tomar(entorno.get("CODEX_HOME"), thread_id)
+            if not ok:
+                return False, err
+            _cerrar_ventana(wid)
+        else:
+            # Sin ventana de tmux pero con el writer tomado: un Codex corriendo
+            # en otra terminal. Ahi no hay ventana a la que saltar, asi que la
+            # unica forma de abrirla es quedarse con ella.
+            pid = pid_con_writer(entorno.get("CODEX_HOME"), thread_id)
+            if pid and not tomar:
+                return False, ("Enter otra vez para tomarla: la tiene abierta "
+                               f"{_donde_corre(pid)}, y se cerraria")
+            if pid:
+                ok, err = _tomar(entorno.get("CODEX_HOME"), thread_id)
+                if not ok:
+                    return False, err
         # Ventana nueva en la misma sesion de tmux.
         tmux_cmd = ["tmux", "new-window", "-P", "-F", "#{window_id}", "-n", nombre]
         if cwd:
